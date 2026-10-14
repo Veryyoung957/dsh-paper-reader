@@ -9,6 +9,11 @@
 // 依赖：跑前先 `npm run build`（脚本会在每次注入 src/ 后自动重建 dist）。
 //
 // 这是**证据工具**，不是 `npm test` 的一部分（名字不匹配 `test/*.test.mjs`，测试运行器不会自动捡它）。
+//
+// ⚠️ **必须在 LF 检出里运行**（评审 F10 的方法学更正）：本表有多条变异锚点是**多行**字符串，
+//    而本仓库 `core.autocrlf=true` 的检出把源文件写成 CRLF ⇒ 锚点会「命中 0 次」。
+//    那是**显式 FAIL**（不静默），所以复现者看到一批 `锚点命中 0 次` 时先查行尾，别当成回归。
+//    真 LF 检出可用：`git -c core.autocrlf=false worktree add --detach <dir> <sha>`。
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
@@ -273,6 +278,25 @@ const MUTATIONS = [
   { id: 'M8-zh-only', file: 'lib/client.js', needsBuild: false, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P21 ',
     from: "migViewReport: 'View migration report',", to: "",
     why: '只加 zh 不补 en（en 文案缺键）' },
+  // ── N t6 repair-round-2（评审 F1–F6 的修复；靶子 = test/migrate-prompt.test.mjs 的 P27–P33）──
+  { id: 'N1-ask-write-not-shared', file: 'lib/client.js', needsBuild: false, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P27 ',
+    from: "      useEffect(() => { migMarkAsked(snap) }, [snap])", to: "      void snap",
+    why: '裁定 (c) 回退：把「渲染问句 ⇒ 记 asked」只留在横幅 ⇒ rail 态（只挂 S2）再也不会记 asked ⇒ 每开一次设置就问一次' },
+  { id: 'N2-mirror-not-selfconsistent', file: 'lib/client.js', needsBuild: false, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P30 ',
+    from: "  if (prompt.level === 'ask' && (choice === 'asked' || choice === 'later' || choice === 'declined')) {", to: "  if (false) {",
+    why: 'F5 回退：镜像直接按旧的 prompt.level 渲染 ⇒ 刷新首帧闪一个「已经问过」的问句' },
+  { id: 'N3-empty-rule-reverted', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P31 ',
+    from: "  } else state = paperDirs > 0 ? 'migrated' : 'empty'", to: "  } else state = markers.done || paperDirs > 0 ? 'migrated' : 'empty'",
+    why: 'F6 回退：空库 + 陈旧 .done 又会被判 migrated ⇒ 界面对空库下「已是新布局」的结论' },
+  { id: 'N4-intro-caliber-reverted', file: 'lib/client.js', needsBuild: false, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P29 ',
+    from: "    .replace('{papers}', String(need?.papers ?? 0))", to: "    .replace('{papers}', String(plan?.totals?.papers ?? 0))",
+    why: '裁定 (a) 回退：弹层篇数改回少算的 plan.totals.papers ⇒ 同一屏两个数字（横幅 3 / 弹层 0）' },
+  { id: 'N5-declined-can-be-downgraded', file: 'src/host.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P28 ',
+    from: "      if (body.choice === 'asked' && prev.choice === 'declined') {", to: "      if (false) {",
+    why: 'F3 回退：迟到的 asked 能把 declined 降级回 asked ⇒ 用户答过「不用」却仍被问，吸态被击穿' },
+  { id: 'N6-identity-axis-ignored', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P32 ',
+    from: "  const sameLibrary = state.dataDir !== null && state.dataDir === need.dataDirId", to: "  const sameLibrary = true",
+    why: '裁定 (b) 回退：不看库身份 ⇒ 「同形状的另一个库」被当成已经问过 ⇒ 静默漏提示' },
 ]
 
 const args = process.argv.slice(2)

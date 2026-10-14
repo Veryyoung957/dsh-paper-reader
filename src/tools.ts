@@ -643,7 +643,8 @@ export function registerTools(ctx: Context, config: PluginConfig) {
   const needSchema = {
     type: 'object',
     properties: {
-      state: { type: 'string', required: true }, papers: { type: 'integer', required: true },
+      state: { type: 'string', required: true }, dataDirId: { type: 'string', required: true },
+      papers: { type: 'integer', required: true },
       files: { type: 'integer', required: true }, migratable: { type: 'integer', required: true },
       orphans: { type: 'integer', required: true }, paperDirs: { type: 'integer', required: true },
       certain: { type: 'boolean', required: true },
@@ -678,7 +679,8 @@ export function registerTools(ctx: Context, config: PluginConfig) {
     name: 'migration_report',
     description:
       '只读干跑报告：扫描文献库并列出「旧（平铺）→ 按论文分文件夹」需要收口的论文/文件、' +
-      '冲突与跳过项、读不进去的子树。**只读：不修改任何文件，也绝不执行迁移**；' +
+      '冲突与跳过项、读不进去的子树。' +
+      '**除「确保数据目录存在」外不修改任何文件，也绝不执行迁移**（干跑走的是迁移预检的同一套只读遍历）；' +
       '执行只能在阅读器/设置面板里由用户确认（需要输入 migrate）。',
     parameters: {},
     output: {
@@ -819,6 +821,8 @@ export function registerTools(ctx: Context, config: PluginConfig) {
         by: 'tool',
         declaredPapers: need.papers,
         fingerprint: need.fingerprint,
+        // 记下这条回答是针对**哪个库**的（t6 队长裁定 (b)：换库要重新问一次）
+        dataDir: need.dataDirId,
       })
       const payload = promptStatePayload(written.state)
       return {

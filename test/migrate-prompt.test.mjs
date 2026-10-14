@@ -10,6 +10,8 @@
 //   P16–P19 四条红线（只提示不迁移 / 不许每次都问 / 不阻塞 / 只读不误报）
 //   P20 缓存与失效   P21 i18n   P22 界面元素   P23 键不会被改名搬家搬走
 //   P24 工具侧 en 文案（逐字冻结）  P25 真跑界面组件（横幅/卡片/报告弹层的行为）
+//   P27–P33 t6 repair-round-2：rail 路径（只挂 S2 也记 asked）/ declined×asked 竞态 / 弹层口径（need）/
+//           镜像首帧自洽 / 空库+陈旧标记 / 换库要重新问（库身份=库根 realpath）/ 描述如实 + body 校验
 //
 // 只 import dist/*.js（跑前 `npm run build`）；破坏性实验一律 mkdtemp 临时库，绝不碰真实文献库。
 // 偏好文件走 DPR_MIGRATE_PROMPT_STATE（夹具内的临时文件）；DSH_HOME 也指到临时目录。
@@ -17,7 +19,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -774,7 +776,8 @@ test('P24 工具侧 en 文案（DPR_MIGRATE_PROMPT_LANG=en）逐字冻结，且�
 const ASK_SNAP = {
   need: {
     state: 'unmigrated', papers: 3, files: 9, migratable: 3, certain: true, markerSync: 'none',
-    fingerprint: 'fp-3', unreadable: [], byClass: { flat: 3, residue: 0, conflict: 0, quarantine: 0 },
+    fingerprint: 'fp-3', dataDirId: '/lib/A', unreadable: [],
+    byClass: { flat: 3, residue: 0, conflict: 0, quarantine: 0 },
   },
   prompt: { level: 'ask', reason: 'unmigrated', text: '【布局提示】…还有 3 篇…' },
 }
@@ -855,6 +858,273 @@ test('P25 真跑界面：横幅按状态渲染、拒绝后消失、重新检查�
     ui.dispose()
     try { rmSync(HOME, { recursive: true, force: true }) } catch { /* 无所谓 */ }
   }
+})
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   t6 repair-round-2：评审 F1–F6 的修复用例（队长三条裁定 + 两条必补用例）
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/** 有状态的假服务端：GET 反映当前 choice，POST/DELETE 真的改状态（rail 路径与竞态用例需要它）。 */
+function makeMigServer(need = ASK_SNAP.need) {
+  const st = { choice: 'idle', dataDir: null, fingerprint: null }
+  const calls = { post: [], del: 0, get: 0 }
+  const promptOf = () => (st.choice === 'idle'
+    ? { level: 'ask', reason: 'unmigrated', text: '【布局提示】…还有 3 篇…' }
+    : { level: 'info', reason: st.choice === 'declined' ? 'declined' : 'already-asked', text: '' })
+  const routes = {
+    'GET /library/migrate-prompt': () => { calls.get++; return { ok: true, need, prompt: promptOf(), state: { ...st } } },
+    'POST /library/migrate-prompt': (opts) => {
+      const b = JSON.parse(opts.body)
+      calls.post.push(b)
+      if (b.choice === 'asked' && st.choice === 'declined') return { ok: true, state: { ...st }, willAsk: false, refused: 'declined' }
+      st.choice = b.choice
+      if (b.dataDir) st.dataDir = b.dataDir
+      if (b.fingerprint) st.fingerprint = b.fingerprint
+      return { ok: true, state: { ...st }, willAsk: b.choice === 'idle' }
+    },
+    'DELETE /library/migrate-prompt': () => { calls.del++; st.choice = 'idle'; return { ok: true, state: { ...st }, willAsk: true } },
+    'GET /library/migrate-plan': () => ({ ok: true, plan: PLAN_STUB, report: '待迁移：3 篇 / 9 个文件' }),
+  }
+  return { st, calls, routes, promptOf }
+}
+/** 故意「少算」的权威报告（F6/F8 的真实形态）：totals.papers=0，但磁盘上有 1 篇冲突。 */
+const PLAN_STUB = {
+  moves: 1, alreadyDone: 0, orphans: 0, paperDirs: 0,
+  conflicts: [{ paper: 'A/P9', target: 'A/P9', reason: '目标名被文件占据' }],
+  quarantine: [], unreadable: [],
+  totals: { papers: 0, files: 0, bytes: 0, needBytes: 0 },
+}
+
+test('P27 裁定(c) rail 路径：只挂载 S2（横幅不渲染）也必须记 asked，且同一情况只记一次', async () => {
+  const store = new Map()
+  store.set('dpr.mode', 'paper')
+  const srv = makeMigServer()
+  const ui = loadClientUi({ store, routes: srv.routes })
+  try {
+    // 只渲染设置卡片 S2 —— 侧栏收起时横幅根本不渲染（rail 态），问句只有卡片在问
+    ui.renderCard()                                   // 首帧：还没拿到 GET（无镜像）
+    await TICKS()                                      // GET 返回并 publish
+    const card = ui.renderCard()                       // 订阅回调触发的重渲染（真实 React 里自动发生）
+    assert.equal(card.out.props['data-dpr-mig-status'], 'migBannerAsk', '卡片确实渲染出了问句')
+    await TICKS()                                      // 这一帧的 effect 才回写 asked（渲染在写之前）
+    assert.equal(srv.st.choice, 'asked', 'rail 路径也必须把 asked 记进服务端（否则每开一次设置就问一次）')
+    const asked = srv.calls.post.filter((b) => b.choice === 'asked')
+    assert.equal(asked.length, 1, '同一情况只记一次')
+    assert.equal(asked[0].dataDir, '/lib/A', '回写必须带库身份（换库要重新问）')
+    assert.equal(asked[0].fingerprint, 'fp-3')
+    // 真实里 re-render 很频繁（两个表面 + 订阅回调）：仍只 POST 一次
+    ui.renderCard()
+    ui.renderCard()
+    await TICKS()
+    assert.equal(srv.calls.post.filter((b) => b.choice === 'asked').length, 1, '重复渲染不许重复 POST')
+    assert.equal(srv.promptOf().level, 'info', '第二次 GET（任一表面）必须是 info —— 不会再问')
+
+    // 服务端那条路也要对：用**界面实际发的载荷形状**走真路由，第二次 GET 必须 info
+    const lib = makeFixture('F1-flat-only')
+    try {
+      const boot = await bootRoutes(lib.data)
+      try {
+        const first = await boot.get('/api/library/migrate-prompt')
+        assert.equal(first.body.prompt.level, 'ask')
+        const need = first.body.need
+        const posted = await boot.postJson('/api/library/migrate-prompt', {
+          choice: 'asked', declaredPapers: need.papers, fingerprint: need.fingerprint, dataDir: need.dataDirId,
+        })
+        assert.equal(posted.status, 200, posted.txt)
+        assert.equal(posted.body.state.choice, 'asked')
+        const second = await boot.get('/api/library/migrate-prompt')
+        assert.equal(second.body.prompt.level, 'info', '第二次 GET 必须 info')
+        assert.equal(second.body.state.choice, 'asked')
+        assert.equal(posted.body.state.dataDir, need.dataDirId, '服务端要记下库身份')
+      } finally { boot.srv.close() }
+    } finally { cleanupFixture(lib) }
+  } finally {
+    ui.dispose()
+    try { rmSync(HOME, { recursive: true, force: true }) } catch { /* 无所谓 */ }
+  }
+})
+
+test('P28 裁定(alt) 竞态：declined 与 asked 交错后最终仍是 declined（吸态不许被击穿）', async () => {
+  const lib = makeFixture('F1-flat-only')
+  try {
+    const boot = await bootRoutes(lib.data)
+    try {
+      const seen = await boot.get('/api/library/migrate-prompt')
+      const need = seen.body.need
+      const declined = await boot.postJson('/api/library/migrate-prompt', { choice: 'declined', dataDir: need.dataDirId })
+      assert.equal(declined.body.state.choice, 'declined')
+      // 横幅那条迟到的 asked（异步 POST 与服务端状态交错）：**不许**把 declined 降级回 asked
+      const late = await boot.postJson('/api/library/migrate-prompt', {
+        choice: 'asked', declaredPapers: need.papers, fingerprint: need.fingerprint, dataDir: need.dataDirId,
+      })
+      assert.equal(late.status, 200, late.txt)
+      assert.equal(late.body.willAsk, false, '拒绝降级时 must 返回 willAsk:false')
+      assert.equal(late.body.state.choice, 'declined', '最终仍是 declined')
+      assert.equal(late.body.refused, 'declined')
+      const after = await boot.get('/api/library/migrate-prompt')
+      assert.equal(after.body.state.choice, 'declined')
+      assert.equal(after.body.prompt.level, 'info', '拒绝了就不许再问')
+      assert.equal(after.body.state.dataDir, need.dataDirId)
+    } finally { boot.srv.close() }
+
+    // 界面侧：镜像已经 declined + 旧快照里还是 ask ⇒ 首帧不渲染问句、更不许 POST asked
+    const store = new Map()
+    store.set('dpr.mode', 'paper')
+    store.set('dpr.migratePrompt', JSON.stringify({ choice: 'declined', snap: { need: ASK_SNAP.need, prompt: { level: 'ask', reason: 'unmigrated', text: 'x' } } }))
+    const srv = makeMigServer()
+    srv.st.choice = 'declined'
+    const ui = loadClientUi({ store, routes: srv.routes })
+    try {
+      assert.equal(ui.renderBanner(), null, '拒绝后横幅不渲染')
+      await TICKS()
+      assert.equal(srv.calls.post.length, 0, '已拒绝 ⇒ 一个 asked 都不许发')
+    } finally {
+      ui.dispose()
+      try { rmSync(HOME, { recursive: true, force: true }) } catch { /* 无所谓 */ }
+    }
+  } finally { cleanupFixture(lib) }
+})
+
+test('P29 裁定(a) 弹层口径：篇数用判据 need（与横幅同源），并注明「其中 N 篇需人工处理」', async () => {
+  const pure = loadClientPure()
+  const zhIntro = /migReportIntro: '([^']+)'/.exec(dictOf('zh'))[1]
+  const tReal = (k) => (k === 'migReportIntro' ? zhIntro : k)
+  // 权威报告 totals.papers=0（少算），判据说还有 3 篇 ⇒ 弹层必须显示 3（一个屏上不许两个数字）
+  const text = pure.reportIntro(PLAN_STUB, { papers: 3, files: 9 }, tReal)
+  assert.match(text, /待迁移 3 篇 \/ 9 个文件/, `必须用 need 口径：${text}`)
+  assert.match(text, /冲突 1 个/)
+  assert.ok(!/待迁移 0 篇/.test(text), '绝不许再出现 plan.totals 的少算数字')
+  // 换了口径要写在纸面上：有 conflict ⇒ 顶部必须给「其中 N 篇需人工处理」
+  const store = new Map()
+  store.set('dpr.mode', 'paper')
+  const srv = makeMigServer()
+  const ui = loadClientUi({ store, routes: srv.routes })
+  try {
+    ui.renderCard().byAct('report').props.onClick()
+    ui.renderCard()
+    const dlg = ui.findDialog()
+    assert.ok(dlg, '必须有报告弹层')
+    ui.renderDialog(dlg)
+    await TICKS()
+    const d = ui.renderDialog(dlg)
+    assert.ok(d.texts.includes('migReportManual'), `顶部必须注明口径：${d.texts.join(' | ')}`)
+  } finally {
+    ui.dispose()
+    try { rmSync(HOME, { recursive: true, force: true }) } catch { /* 无所谓 */ }
+  }
+})
+
+test('P30 低危 F5 镜像首帧：prompt 与 state 自洽（刷新不许闪一个已经问过的问句）', async () => {
+  const pure = loadClientPure()
+  assert.equal(pure.mirrorPrompt({ choice: 'asked' }, { level: 'ask', text: 'x' }).level, 'info')
+  assert.equal(pure.mirrorPrompt({ choice: 'later' }, { level: 'ask', text: 'x' }).level, 'info')
+  assert.equal(pure.mirrorPrompt({ choice: 'declined' }, { level: 'ask', text: 'x' }).level, 'info')
+  assert.equal(pure.mirrorPrompt({ choice: 'asked' }, { level: 'ask', text: 'x' }).text, '')
+  assert.equal(pure.mirrorPrompt({ choice: 'idle' }, { level: 'ask', text: 'x' }).level, 'ask', '正对照：还没问过就照常问')
+  assert.equal(pure.mirrorPrompt({ choice: 'asked' }, { level: 'info', text: '' }).level, 'info')
+  assert.equal(pure.mirrorPrompt(null, null), null)
+
+  const store = new Map()
+  store.set('dpr.mode', 'paper')
+  // 镜像里 state 已经 asked（横幅渲染问句后立刻回写过），但 prompt 还是**写回之前**那份 ask
+  store.set('dpr.migratePrompt', JSON.stringify({
+    choice: 'asked', fingerprint: 'fp-3', dataDir: '/lib/A',
+    snap: { need: ASK_SNAP.need, prompt: { level: 'ask', reason: 'unmigrated', text: 'x' } },
+  }))
+  const srv = makeMigServer()
+  srv.st.choice = 'asked'
+  const ui = loadClientUi({ store, routes: srv.routes })
+  try {
+    const b = ui.renderBanner()
+    assert.ok(b, '横幅仍要显示（安静条）')
+    assert.equal(b.out.props['data-dpr-mig-mode'], 'quiet', '首帧必须是安静条 —— 不许闪问句')
+    await TICKS()
+    assert.equal(srv.calls.post.length, 0, '已经问过 ⇒ 不许再 POST asked')
+  } finally {
+    ui.dispose()
+    try { rmSync(HOME, { recursive: true, force: true }) } catch { /* 无所谓 */ }
+  }
+})
+
+test('P31 低危 F6 空库 + 陈旧 .done：优先判 empty（不许对空库下「已是新布局」的结论）', async () => {
+  const lib = newLib()
+  try {
+    writeAt(lib.data, DONE, '{}')                       // 只有陈旧标记，一篇论文都没有
+    const need = MP.detectMigrationNeed(lib.data, { force: true })
+    assert.equal(need.papers, 0)
+    assert.equal(need.paperDirs, 0)
+    assert.equal(need.state, 'empty', 'papers===0 && paperDirs===0 ⇒ empty，标记不作为「已迁移」的唯一依据')
+    const taken = MP.takeMigrationPrompt(need)
+    assert.equal(taken.level, 'silent')
+    assert.equal(taken.text, '')
+    const pure = loadClientPure()
+    assert.equal(pure.statusKey('silent', 'empty', 'idle'), 'empty', '界面说「文献库为空」，不说「已是新布局」')
+    // 正对照：真迁移过的库（有论文文件夹）仍判 migrated —— 别把这条修成「一律 empty」
+    const lib2 = makeFixture('F2-migrated')
+    try {
+      const n2 = MP.detectMigrationNeed(lib2.data, { force: true })
+      assert.equal(n2.state, 'migrated')
+      assert.equal(MP.takeMigrationPrompt(n2).level, 'silent')
+    } finally { cleanupFixture(lib2) }
+  } finally { cleanupFixture(lib) }
+})
+
+test('P32 裁定(b) 换库要重新问：库身份 = 库根 realpath（同形状的另一个库不算「已经问过」）', async () => {
+  const a = makeFixture('F1-flat-only')
+  const b = newLib()               // 与 a **同形状**的另一份库（另一个库根）
+  FIXTURES['F1-flat-only'].build(b.data)
+  process.env.DPR_MIGRATE_PROMPT_STATE = join(a.home, 'shared-state.json')   // 两个库共用一份偏好
+  try {
+    const needA = MP.detectMigrationNeed(a.data, { force: true })
+    const needB = MP.detectMigrationNeed(b.data, { force: true })
+    assert.equal(needA.fingerprint, needB.fingerprint, '夹具前提：两个库形状完全相同（内容指纹一致）')
+    assert.notEqual(needA.dataDirId, needB.dataDirId, '库身份必须不同（库根 realpath）')
+    assert.equal(needA.dataDirId, realpathSync(a.data))
+
+    const toolsA = makeTools(a.data)
+    const firstA = await toolsA.list_papers.execute({}, {})
+    assert.equal(firstA.migration.level, 'ask')
+    assert.equal(MP.readPromptState().dataDir, needA.dataDirId, '回答要记下「是针对哪个库的」')
+    assert.equal((await toolsA.list_papers.execute({}, {})).migration.level, 'info', '同一个库第二次不问')
+
+    // 换到**同形状**的另一个库：必须重新问一次（否则 = 静默漏提示，比多问一次差）
+    const toolsB = makeTools(b.data)
+    const firstB = await toolsB.list_papers.execute({}, {})
+    assert.equal(firstB.migration.level, 'ask', '换库必须重新问一次')
+    assert.equal(firstB.migration.papers, 3)
+    assert.equal(MP.readPromptState().dataDir, needB.dataDirId)
+    assert.equal((await toolsB.list_papers.execute({}, {})).migration.level, 'info', 'B 库第二次也不问')
+
+    // 库内改名 ⇒ 内容指纹变了 ⇒ 按 §1.2 会带新数字再问一次（既有设计，与「库身份」正交，此处固定住）
+    renameSync(join(b.data, 'A'), join(b.data, 'A2'))
+    MP.invalidateMigrationPromptCache()
+    const renamed = await toolsB.list_papers.execute({}, {})
+    assert.equal(renamed.migration.level, 'ask', '改名改变内容指纹 ⇒ 再问一次（§1.2；已写进方案更正）')
+  } finally {
+    cleanupFixture(a)
+    rmSync(b.root, { recursive: true, force: true })
+  }
+})
+
+test('P33 低危 F7/F8：报告描述如实（会确保目录存在）+ POST body 必须 typeof string 且枚举', async () => {
+  const lib = makeFixture('F1-flat-only')
+  try {
+    const tools = makeTools(lib.data)
+    assert.match(tools.migration_report.description, /除「确保数据目录存在」外不修改任何文件/,
+      '描述不许再声称「不修改任何文件」（报告路径会 mkdir 数据目录）')
+    assert.ok(!/只读：不修改任何文件/.test(tools.migration_report.description))
+
+    const boot = await bootRoutes(lib.data)
+    try {
+      for (const bad of [{ choice: ['asked'] }, { choice: 1 }, { choice: null }, { choice: 'nope' }, {}, { choice: 'asked ' }]) {
+        const r = await boot.postJson('/api/library/migrate-prompt', bad)
+        assert.equal(r.status, 400, `${JSON.stringify(bad)} 必须 400（不许 String() 强转放行），实际 ${r.status} ${r.txt}`)
+      }
+      const ok = await boot.postJson('/api/library/migrate-prompt', { choice: 'asked' })
+      assert.equal(ok.status, 200, ok.txt)
+      assert.equal(ok.body.state.choice, 'asked')
+    } finally { boot.srv.close() }
+  } finally { cleanupFixture(lib) }
 })
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -995,7 +1265,7 @@ function loadClientPure() {
   const ctx = { window: { __ModuleLoader__: { load: (m) => { loaded = m } } }, console }
   vm.createContext(ctx)
   vm.runInContext(readFileSync(join(REPO, 'lib', 'client.js'), 'utf8')
-    + '\n;globalThis.__dprMigPure = { key: DPR_MIGRATE_PROMPT_KEY, bannerMode: dprMigrateBannerMode, statusKey: dprMigrateStatusKey, execEnabled: dprMigrateExecEnabled };', ctx, { filename: 'client-mig-pure.js' })
+    + '\n;globalThis.__dprMigPure = { key: DPR_MIGRATE_PROMPT_KEY, bannerMode: dprMigrateBannerMode, statusKey: dprMigrateStatusKey, execEnabled: dprMigrateExecEnabled, mirrorPrompt: dprMigrateMirrorPrompt, reportIntro: dprMigrateReportIntro };', ctx, { filename: 'client-mig-pure.js' })
   assert.ok(loaded && typeof loaded.factory === 'function', 'client.js 必须通过 __ModuleLoader__.load 注册模块')
   PURE = ctx.__dprMigPure
   return PURE

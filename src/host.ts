@@ -1029,8 +1029,9 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
     }
 
     if (sub === '/api/library/migrate-prompt' && req.method === 'POST') {
-      const body = (await readBody(req)) as { choice?: string; declaredPapers?: number; fingerprint?: string }
-      if (!['asked', 'later', 'declined', 'idle'].includes(String(body.choice))) {
+      const body = (await readBody(req)) as { choice?: unknown; declaredPapers?: number; fingerprint?: string; dataDir?: string }
+      // t6 低危 F8：**必须** typeof 字符串 + 枚举（原先 String(body.choice) 会把 ['asked'] 强转成 'asked' 放进来）
+      if (typeof body.choice !== 'string' || !['asked', 'later', 'declined', 'idle'].includes(body.choice)) {
         json(res, 400, { error: 'choice 必须是 asked / later / declined / idle', code: 'bad-request' })
         return
       }
@@ -1039,11 +1040,22 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
         json(res, 200, { ok: true, state: promptStatePayload(resetPromptState()), willAsk: true })
         return
       }
-      // 未给指纹/篇数时**保留**上一份（否则界面只发 {choice:'asked'} 会把「同一指纹不再问」的门拆掉）
-      const patch: { choice: 'asked' | 'later' | 'declined'; at: string; by: 'ui'; declaredPapers?: number; fingerprint?: string } =
-        { choice: body.choice as 'asked' | 'later' | 'declined', at: new Date().toISOString(), by: 'ui' }
+      // t6 低危 F3：**declined 不许被 asked 降级**。界面的「不再提醒」与服务端「已问过一次」会交错
+      //（横幅渲染问句时异步 POST asked，用户可能同时点了不再提醒）：谁后到都不许复活问句，
+      // 否则红线②的吸态被击穿。拒绝降级不是错误（200），但 willAsk=false 明确告诉调用方「不会再问」。
+      const prev = readPromptState()
+      if (body.choice === 'asked' && prev.choice === 'declined') {
+        json(res, 200, { ok: true, state: promptStatePayload(prev), willAsk: false, refused: 'declined' })
+        return
+      }
+      // 未给指纹/篇数/库身份时**保留**上一份（否则界面只发 {choice:'asked'} 会把「同一指纹不再问」的门拆掉）
+      const patch: {
+        choice: 'asked' | 'later' | 'declined'; at: string; by: 'ui'
+        declaredPapers?: number; fingerprint?: string; dataDir?: string
+      } = { choice: body.choice as 'asked' | 'later' | 'declined', at: new Date().toISOString(), by: 'ui' }
       if (typeof body.declaredPapers === 'number' && Number.isFinite(body.declaredPapers)) patch.declaredPapers = body.declaredPapers
       if (typeof body.fingerprint === 'string' && body.fingerprint) patch.fingerprint = body.fingerprint
+      if (typeof body.dataDir === 'string' && body.dataDir) patch.dataDir = body.dataDir
       const written = writePromptState(patch)
       const state = promptStatePayload(written.state)
       json(res, 200, { ok: written.ok, state, willAsk: state.choice === 'idle' })

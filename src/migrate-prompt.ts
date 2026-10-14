@@ -18,7 +18,7 @@
 // `GET /api/library/migrate-plan`（planMigration，含 sha256）才是权威。探针实测两者在 12 个夹具上
 // 分类与 stale 集合**零差异**（.probe/migrate-prompt/，方案 §0.3）；文案只给篇数、不展开 residue/conflict 细节。
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { dirname, join, resolve } from 'node:path'
 import { dshHome, isPaperDir, isPaperPDF } from './library.ts'
@@ -41,6 +41,9 @@ export type MigrationState =
 
 export interface MigrationNeed {
   dataDir: string
+  /** **库身份**（库根 realpath）：与「库形态指纹」是两个正交的轴 —— 见 decideMigrationPrompt 的说明。
+      t6 队长裁定 (b)：换库（根不同）必须重新问一次；同一库内改名/增删只看 fingerprint。 */
+  dataDirId: string
   scannedAt: string
   state: MigrationState
   /** ★ 文案里的「还有 N 篇」（**不是** plan.totals.papers——它在 conflict/quarantine 下会少算成 0） */
@@ -82,6 +85,7 @@ function sizeOf(file: string): number {
 function emptyNeed(root: string, state: MigrationState): MigrationNeed {
   return {
     dataDir: root,
+    dataDirId: dataDirIdOf(root),
     scannedAt: new Date().toISOString(),
     state,
     papers: 0,
@@ -96,6 +100,14 @@ function emptyNeed(root: string, state: MigrationState): MigrationNeed {
     markerSync: 'none',
     fingerprint: fingerprintOf([], 0),
   }
+}
+
+/**
+ * 库身份 = 库根的 realpath（拿不到时退回 resolve）。用它而**不是**专题名：
+ * 专题/论文改名不改变身份，换一个库（另一份 data 目录）则必然不同。
+ */
+function dataDirIdOf(root: string): string {
+  try { return realpathSync(root) } catch { return resolve(root) }
 }
 
 function fingerprintOf(hits: FlatHit[], unreadableCount: number): string {
@@ -207,10 +219,14 @@ function scanOnce(root: string): MigrationNeed {
     else if (byClass.flat > 0) state = 'unmigrated'
     else if (migratable > 0) state = 'residue'
     else state = 'needs-manual'
-  } else state = markers.done || paperDirs > 0 ? 'migrated' : 'empty'
+  } else state = paperDirs > 0 ? 'migrated' : 'empty'
+  // 注（t6 低危 F6）：**空库 + 陈旧 .done** 过去会被判 'migrated' ⇒ 界面显示「已是新布局」（对一个
+  // 一篇论文都没有的库下布局结论 = 误报）。现在 papers===0 且 paperDirs===0 ⇒ 'empty'，标记只进
+  // markerSync（如实表达分歧），不再单独构成「已迁移」的证据。
 
   return {
     dataDir: root,
+    dataDirId: dataDirIdOf(root),
     scannedAt: new Date().toISOString(),
     state,
     papers,
@@ -282,6 +298,8 @@ export interface PromptState {
   by: 'tool' | 'ui' | null
   declaredPapers: number | null
   fingerprint: string | null
+  /** 记下「这条回答是针对哪个库的」（库根 realpath）：换库 ⇒ 重新问一次（t6 队长裁定 (b)） */
+  dataDir: string | null
   pluginVersion: string
 }
 
@@ -295,7 +313,7 @@ export function migrationPromptStatePath(): string {
 }
 
 export function idlePromptState(): PromptState {
-  return { v: 1, key: PROMPT_KEY, choice: 'idle', at: null, by: null, declaredPapers: null, fingerprint: null, pluginVersion: PLUGIN_VERSION }
+  return { v: 1, key: PROMPT_KEY, choice: 'idle', at: null, by: null, declaredPapers: null, fingerprint: null, dataDir: null, pluginVersion: PLUGIN_VERSION }
 }
 
 /** 任何字段非法 / 文件缺失 / JSON 坏 ⇒ 回落 idle（最坏结果是多问一次，不致命）。 */
@@ -315,6 +333,7 @@ function normalizeState(raw: unknown): PromptState {
     by,
     declaredPapers: declared,
     fingerprint: typeof r['fingerprint'] === 'string' ? r['fingerprint'] : null,
+    dataDir: typeof r['dataDir'] === 'string' && r['dataDir'] ? r['dataDir'] : null,
     pluginVersion: typeof r['pluginVersion'] === 'string' ? r['pluginVersion'] : PLUGIN_VERSION,
   }
 }
@@ -361,9 +380,13 @@ export function resetPromptState(): PromptState {
 
 /** 供 UI/测试用的公开形状（只暴露状态本身，不泄路径）。 */
 export function promptStatePayload(state: PromptState): {
-  choice: PromptChoice; at: string | null; by: 'tool' | 'ui' | null; declaredPapers: number | null; fingerprint: string | null
+  choice: PromptChoice; at: string | null; by: 'tool' | 'ui' | null; declaredPapers: number | null
+  fingerprint: string | null; dataDir: string | null
 } {
-  return { choice: state.choice, at: state.at, by: state.by, declaredPapers: state.declaredPapers, fingerprint: state.fingerprint }
+  return {
+    choice: state.choice, at: state.at, by: state.by, declaredPapers: state.declaredPapers,
+    fingerprint: state.fingerprint, dataDir: state.dataDir,
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -487,11 +510,18 @@ export function decideMigrationPrompt(need: MigrationNeed, state: PromptState, o
     return { level: 'info', reason: 'needs-manual', text: note ? `${text}\n${note}` : text, askHint: null }
   }
   // 到这里一定是 ask 类状态（unmigrated/residue/partial/marker-mismatch，migratable>0）
-  if (state.choice === 'declined') {
-    // declined 是吸态：任何检测（含新论文出现）都只降级为 info，只有显式「重新检查」才回 idle
+  // 「这条回答还算不算数」要同时看**两个正交的轴**（t6 队长裁定 (b)）：
+  //   · 库身份（dataDirId，库根 realpath）：不同库 ⇒ 上一次的回答与这个库无关 ⇒ 必须重新问
+  //     （不这样做时「同形状的另一个库」会被当成「已经问过」⇒ 静默漏提示，而漏提示比多问一次差）；
+  //   · 库形态指纹（fingerprint，含分类）：同一库内篇数/分类变化 ⇒ 带新数字再问一次。
+  // 老状态文件没记库身份（dataDir=null）⇒ 视为「不同库」，最多多问一次。
+  const sameLibrary = state.dataDir !== null && state.dataDir === need.dataDirId
+  if (state.choice === 'declined' && sameLibrary) {
+    // declined 是吸态：**在同一个库内**任何检测（含新论文出现）都只降级为 info，
+    // 只有显式「重新检查」/换库才回 idle 语义。
     return { level: 'info', reason: 'declined', text: '', askHint: null }
   }
-  if (state.choice === 'asked' || state.choice === 'later') {
+  if ((state.choice === 'asked' || state.choice === 'later') && sameLibrary) {
     if (state.fingerprint && state.fingerprint === need.fingerprint) {
       return { level: 'info', reason: state.choice === 'later' ? 'later' : 'already-asked', text: '', askHint: null }
     }
@@ -520,6 +550,7 @@ export function takeMigrationPrompt(need: MigrationNeed, opts: { lang?: PromptLa
     by: opts.by ?? 'tool',
     declaredPapers: need.papers,
     fingerprint: need.fingerprint,
+    dataDir: need.dataDirId,
   })
   return { ...decision, asked: true, state: written.state }
 }
