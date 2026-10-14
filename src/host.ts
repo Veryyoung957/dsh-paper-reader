@@ -1035,35 +1035,55 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
         json(res, 400, { error: 'choice 必须是 asked / later / declined / idle', code: 'bad-request' })
         return
       }
-      // `idle` = 「重新检查」的另一种写法（清掉回答）
+      // t8 R5：`body.dataDir` 缺失时用**当前判据**兜底（`need.dataDirId`）—— 否则会记下一条「门不认」的回答：
+      // 卡片按钮在快照加载完成前就会渲染（真实可达路径），此时 `dataDir=null` ⇒ 门按「不是同一个库」判 ⇒
+      // 界面上写着「不会再主动询问」、下一拍 GET 却仍然 ask（评审 G14）。兜底只在缺字段时走一次判据。
+      const bodyDir = typeof body.dataDir === 'string' && body.dataDir ? body.dataDir : null
+      let need = bodyDir === null ? detectMigrationNeed(dataDir) : null
+      const needOf = (): ReturnType<typeof detectMigrationNeed> => need ?? (need = detectMigrationNeed(dataDir))
+      const dirId = bodyDir ?? needOf().dataDirId
+
+      // `idle` = 「重新检查」的另一种写法（清掉回答）。willAsk 由**门控**推导（见下），不靠 state.choice 猜。
       if (body.choice === 'idle') {
-        json(res, 200, { ok: true, state: promptStatePayload(resetPromptState()), willAsk: true })
+        const state = resetPromptState()
+        const decision = decideMigrationPrompt(needOf(), state)
+        json(res, 200, { ok: true, state: promptStatePayload(state), willAsk: decision.level === 'ask' })
         return
       }
-      // t6 低危 F3：**declined 不许被 asked 降级**。界面的「不再提醒」与服务端「已问过一次」会交错
-      //（横幅渲染问句时异步 POST asked，用户可能同时点了不再提醒）：谁后到都不许复活问句，
-      // 否则红线②的吸态被击穿。拒绝降级不是错误（200），但 willAsk=false 明确告诉调用方「不会再问」。
+
+      // F3（t6）+ t8 R2/R3：`declined` 是**吸态**，但作用域是「**同一个库**」——
+      //   · 同一库：任何**弱回答**（asked / later）都不许把它降级（否则两个标签页就能把「不再提醒」复活）；
+      //   · 换库（库根 realpath 不同）：上一条回答与这个库无关 ⇒ 必须允许把新库的 asked 记进去并更新 dataDir，
+      //     否则裁定 (b)「换库要重新问」的**界面半边**永远落不了地（服务端会问、界面记不上 ⇒ 每次渲染都问）。
+      // 拒绝降级不是错误（200），但 willAsk=false 明确告诉调用方「这个库不会再问」。
       const prev = readPromptState()
-      if (body.choice === 'asked' && prev.choice === 'declined') {
+      const sameLibrary = prev.dataDir !== null && prev.dataDir === dirId
+      const weakAnswer = body.choice === 'asked' || body.choice === 'later'
+      if (sameLibrary && prev.choice === 'declined' && weakAnswer) {
         json(res, 200, { ok: true, state: promptStatePayload(prev), willAsk: false, refused: 'declined' })
         return
       }
-      // 未给指纹/篇数/库身份时**保留**上一份（否则界面只发 {choice:'asked'} 会把「同一指纹不再问」的门拆掉）
+      // 未给指纹/篇数时**保留**上一份（否则界面只发 {choice:'asked'} 会把「同一指纹不再问」的门拆掉）；
+      // 库身份则一律写成这次判定的那个（缺字段时是兜底值）——「这条回答属于哪个库」必须确定。
       const patch: {
         choice: 'asked' | 'later' | 'declined'; at: string; by: 'ui'
-        declaredPapers?: number; fingerprint?: string; dataDir?: string
-      } = { choice: body.choice as 'asked' | 'later' | 'declined', at: new Date().toISOString(), by: 'ui' }
+        declaredPapers?: number; fingerprint?: string; dataDir: string
+      } = { choice: body.choice as 'asked' | 'later' | 'declined', at: new Date().toISOString(), by: 'ui', dataDir: dirId }
       if (typeof body.declaredPapers === 'number' && Number.isFinite(body.declaredPapers)) patch.declaredPapers = body.declaredPapers
       if (typeof body.fingerprint === 'string' && body.fingerprint) patch.fingerprint = body.fingerprint
-      if (typeof body.dataDir === 'string' && body.dataDir) patch.dataDir = body.dataDir
       const written = writePromptState(patch)
       const state = promptStatePayload(written.state)
-      json(res, 200, { ok: written.ok, state, willAsk: state.choice === 'idle' })
+      // t8 R5：`willAsk` 由**门控推导**（拿写后的状态再过一次 decide），不用 `state.choice === 'idle'` 猜 ——
+      // 应答里的「还会不会再问」必须与 GET 的实际门控一致（评审 G14 就是这条不一致）。
+      const decision = decideMigrationPrompt(needOf(), written.state)
+      json(res, 200, { ok: written.ok, state, willAsk: decision.level === 'ask' })
       return
     }
 
     if (sub === '/api/library/migrate-prompt' && req.method === 'DELETE') {
-      json(res, 200, { ok: true, state: promptStatePayload(resetPromptState()), willAsk: true })
+      const state = resetPromptState()
+      const decision = decideMigrationPrompt(detectMigrationNeed(dataDir), state)
+      json(res, 200, { ok: true, state: promptStatePayload(state), willAsk: decision.level === 'ask' })
       return
     }
 

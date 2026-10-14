@@ -1128,6 +1128,183 @@ test('P33 低危 F7/F8：报告描述如实（会确保目录存在）+ POST bod
 })
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   t8 repair-round-3：R1–R6 的修复用例（P34 换库/指纹变化的记账；P35 同库弱回答不许降级）
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/** 从出货源码里按函数头抽出配对代码块（与 t7 评审抽函数真跑同一手法）。 */
+function extractFnText(src, header) {
+  const at = src.indexOf(header)
+  assert.ok(at >= 0, `源码里找不到：${header}`)
+  const braceAt = src.indexOf('{', at)
+  let depth = 0; let i = braceAt; let kind = 'code'
+  while (i < src.length) {
+    const c = src[i]; const n = src[i + 1]
+    if (kind === 'code') {
+      if (c === '/' && n === '/') { kind = 'line'; i += 2; continue }
+      if (c === '/' && n === '*') { kind = 'block'; i += 2; continue }
+      if (c === '"' || c === "'" || c === '`') { kind = c; i += 1; continue }
+      if (c === '{') depth += 1
+      else if (c === '}') { depth -= 1; if (depth === 0) return src.slice(at, i + 1) }
+    } else if (kind === 'line') { if (c === '\n') kind = 'code' }
+    else if (kind === 'block') { if (c === '*' && n === '/') { kind = 'code'; i += 2; continue } }
+    else { if (c === '\\') { i += 2; continue } if (c === kind) kind = 'code' }
+    i += 1
+  }
+  throw new Error(`extractFnText: ${header} 的代码块没有闭合`)
+}
+
+/** 真跑出货的 `migMarkAsked`（闭包补丁 `let migAskedFp = null`）。 */
+function migAskedHarness() {
+  const body = extractFnText(CLIENT_SRC, 'function migMarkAsked(')
+  const calls = []
+  const api = (path, opts) => { calls.push(JSON.parse(opts.body)); return Promise.resolve({ state: { choice: 'asked' } }) }
+  const mark = new Function('api', 'migMirrorWrite', `let migAskedFp = null;\n${body}\n;return migMarkAsked;`)(api, () => {})
+  return { calls, mark }
+}
+const snapOf = (level, choice, { fp = 'f'.repeat(12), dir = '/lib/A', papers = 2, state = 'unmigrated' } = {}) => ({
+  need: { fingerprint: fp, dataDirId: dir, papers, state }, prompt: { level }, state: { choice, dataDir: dir },
+})
+
+test('P34 裁定(a)/R1 记账由服务端门推导：同库指纹变化、换库同指纹都要能记（双轴键）', async () => {
+  // ── (1) 真跑出货的 migMarkAsked：双轴去重键 ──────────────────────────────
+  const h = migAskedHarness()
+  await h.mark(snapOf('ask', 'later', { fp: 'a'.repeat(12), dir: '/lib/A' }))
+  assert.equal(h.calls.length, 1, '服务端说 ask（同库、指纹变了）⇒ 必须记（旧守卫 choice!==idle 会 0 次）')
+  await h.mark(snapOf('ask', 'asked', { fp: 'a'.repeat(12), dir: '/lib/A' }))
+  assert.equal(h.calls.length, 1, '同库同指纹再渲染 ⇒ 去重，不许重复 POST')
+  await h.mark(snapOf('ask', 'asked', { fp: 'a'.repeat(12), dir: '/lib/B' }))
+  assert.equal(h.calls.length, 2, '换库（指纹相同）⇒ 必须再记一次（单轴键会漏 ⇒ 界面反复问）')
+  assert.equal(h.calls[1].dataDir, '/lib/B', '记的是新库的身份')
+  await h.mark(snapOf('ask', 'declined', { fp: 'b'.repeat(12), dir: '/lib/A' }))
+  assert.equal(h.calls.length, 3, 'declined 属于另一个库时也要能记（服务端按库作用域放行）')
+  await h.mark(snapOf('info', 'idle', { dir: '/lib/A' }))
+  assert.equal(h.calls.length, 3, '服务端说 info ⇒ 不记（记账条件就是 level===ask）')
+
+  // ── (2) 组件路径：服务端说 ask、但 state 属于**另一个库** ────────────────
+  const store = new Map()
+  store.set('dpr.mode', 'paper')
+  const posts = []
+  const srv = {
+    need: { ...ASK_SNAP.need, dataDirId: '/lib/B' },
+    state: { choice: 'declined', dataDir: '/lib/A', fingerprint: 'fp-3' },   // 上一条回答属于 A
+    prompt: { level: 'ask', reason: 'unmigrated', text: 'x' },
+  }
+  const ui = loadClientUi({
+    store,
+    routes: {
+      'GET /library/migrate-prompt': () => ({ ok: true, need: srv.need, prompt: srv.prompt, state: srv.state }),
+      'POST /library/migrate-prompt': (opts) => {
+        posts.push(JSON.parse(opts.body))
+        srv.state = { choice: 'asked', dataDir: posts[posts.length - 1].dataDir, fingerprint: posts[posts.length - 1].fingerprint }
+        return { ok: true, state: srv.state, willAsk: false }
+      },
+      'GET /library/migrate-plan': () => ({ ok: true, plan: PLAN_STUB, report: '' }),
+    },
+  })
+  try {
+    ui.renderCard()
+    await TICKS()
+    const card = ui.renderCard()
+    assert.equal(card.out.props['data-dpr-mig-status'], 'migBannerAsk',
+      '上一条 declined 属于**另一个库** ⇒ 这个库仍要渲染问句（按 idle 走），不许静默藏起来')
+    await TICKS()
+    assert.equal(posts.length, 1, '服务端说 ask ⇒ 记账一次')
+    assert.equal(posts[0].dataDir, '/lib/B', '记到当前这个库上（否则服务端门不认）')
+    assert.equal(card.byAct('later') !== null, true, '问句在 ⇒ 弱回答按钮也在（这个库还没回答过）')
+  } finally {
+    ui.dispose()
+    try { rmSync(HOME, { recursive: true, force: true }) } catch { /* 无所谓 */ }
+  }
+})
+
+test('P35 裁定(d)/R3 同库弱回答不许降级（服务端含 later；界面三处都不渲染弱回答按钮）', async () => {
+  const lib = makeFixture('F1-flat-only')
+  const stateFile = process.env.DPR_MIGRATE_PROMPT_STATE
+  const lib2 = newLib()                      // 内容与 lib **同形状**的另一个库（换库场景要用真库根）
+  FIXTURES['F1-flat-only'].build(lib2.data)
+  process.env.DPR_MIGRATE_PROMPT_STATE = stateFile   // 两个库共用同一份偏好文件
+  try {
+    const boot = await bootRoutes(lib.data)
+    try {
+      const seen = await boot.get('/api/library/migrate-prompt')
+      const need = seen.body.need
+      const first = await boot.postJson('/api/library/migrate-prompt', { choice: 'declined', dataDir: need.dataDirId })
+      assert.equal(first.body.state.choice, 'declined')
+      // R3①：**later 也不许**把同库的 declined 降级（评审 G5-later / C11）
+      const later = await boot.postJson('/api/library/migrate-prompt', {
+        choice: 'later', declaredPapers: need.papers, fingerprint: need.fingerprint, dataDir: need.dataDirId,
+      })
+      assert.equal(later.status, 200, later.txt)
+      assert.equal(later.body.state.choice, 'declined', 'later 不许覆盖同库的 declined（吸态）')
+      assert.equal(later.body.willAsk, false)
+      assert.equal(later.body.refused, 'declined')
+      // R2：换到**真库根的另一个库**则允许写入（裁定 (b) 的界面半边）
+      const boot2 = await bootRoutes(lib2.data)
+      try {
+        const seen2 = await boot2.get('/api/library/migrate-prompt')
+        const need2 = seen2.body.need
+        assert.notEqual(need2.dataDirId, need.dataDirId, '夹具前提：两个库根不同')
+        assert.equal(need2.fingerprint, need.fingerprint, '夹具前提：形状相同（指纹一致）')
+        assert.equal(seen2.body.prompt.level, 'ask', '换库 ⇒ 服务端会重新问（裁定 b）')
+        const other = await boot2.postJson('/api/library/migrate-prompt', {
+          choice: 'asked', declaredPapers: need2.papers, fingerprint: need2.fingerprint, dataDir: need2.dataDirId,
+        })
+        assert.equal(other.body.refused, undefined, '换库不许被 refused（否则界面半边落不了地）')
+        assert.equal(other.body.state.choice, 'asked', '换库允许写入新库的 asked')
+        assert.equal(other.body.state.dataDir, need2.dataDirId, '并把库身份更新为新库')
+        assert.equal(other.body.willAsk, false, 'willAsk 由门控推导（新库已 asked、同指纹 ⇒ 不再问）')
+        // R5：不带 dataDir 的 POST 也必须被门控认可（服务端用当前 need 兜底）
+        const cold = await boot2.postJson('/api/library/migrate-prompt', { choice: 'declined' })
+        assert.equal(cold.body.state.dataDir, need2.dataDirId, 'R5：缺 dataDir 时服务端用当前判据兜底')
+        assert.equal(cold.body.willAsk, false, 'R5：willAsk 由门控推导（同库 declined + 同指纹 ⇒ 不再问）')
+        const after = await boot2.get('/api/library/migrate-prompt')
+        assert.equal(after.body.prompt.level, 'info', 'R5：应答说不会再问，GET 也必须真的不再问（评审 G14）')
+      } finally { boot2.srv.close() }
+    } finally { boot.srv.close() }
+
+    // ── 界面侧：declined 时三处表面都不渲染弱回答按钮 ─────────────────────
+    const store = new Map()
+    store.set('dpr.mode', 'paper')
+    const snap = { need: { ...ASK_SNAP.need, dataDirId: '/lib/A' }, state: { choice: 'declined', dataDir: '/lib/A', fingerprint: 'fp-3' } }
+    const ui = loadClientUi({
+      store,
+      routes: {
+        'GET /library/migrate-prompt': () => ({ ok: true, need: snap.need, prompt: { level: 'info', reason: 'declined', text: '' }, state: snap.state }),
+        'GET /library/migrate-plan': () => ({ ok: true, plan: PLAN_STUB, report: '' }),
+        'POST /library/migrate-prompt': () => ({ ok: true, state: snap.state, willAsk: false }),
+      },
+    })
+    try {
+      ui.renderCard()
+      await TICKS()
+      const card = ui.renderCard()
+      assert.equal(card.byAct('later'), null, '卡片：declined 时不渲染「以后再说」')
+      assert.equal(card.byAct('never'), null, '卡片：declined 时不渲染「不再提醒」')
+      assert.equal(card.byAct('recheck') !== null, true, '「重新检查」一直在（唯一的恢复入口）')
+      // 弹层：同一规则
+      card.byAct('report').props.onClick()
+      ui.renderCard()
+      const dlg = ui.findDialog()
+      assert.ok(dlg, '报告弹层要能打开')
+      ui.renderDialog(dlg)
+      await TICKS()
+      const d = ui.renderDialog(dlg)
+      assert.equal(findNode(d.exec ? d.exec : null, (n) => n.props && n.props['data-dpr-mig'] === 'later'), null)
+      assert.equal(d.texts.includes('migLater'), false, '弹层：declined 时不渲染弱回答按钮')
+      assert.equal(d.texts.includes('migReportTitle'), true, '弹层其余内容照常')
+      // 横幅：declined 时整个不渲染（更不会露出弱回答按钮）
+      assert.equal(ui.renderBanner(), null, '横幅：declined 时不渲染')
+    } finally {
+      ui.dispose()
+      try { rmSync(HOME, { recursive: true, force: true }) } catch { /* 无所谓 */ }
+    }
+  } finally {
+    cleanupFixture(lib)
+    rmSync(lib2.root, { recursive: true, force: true })
+  }
+})
+
+/* ═══════════════════════════════════════════════════════════════════════════
    工具
    ═══════════════════════════════════════════════════════════════════════════ */
 

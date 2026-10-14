@@ -378,7 +378,11 @@ export function resetPromptState(): PromptState {
   return idlePromptState()
 }
 
-/** 供 UI/测试用的公开形状（只暴露状态本身，不泄路径）。 */
+/**
+ * 供 UI/测试用的公开形状。**注意它含 `dataDir`（库根 realpath）**（t8 R6：注释与返回值对齐）：
+ * 这条字段是唯一能诊断「上一条回答是针对哪个库的」的东西（裁定 (b) 的双轴门与界面都靠它），
+ * 而 GET 本来就回 `need.dataDir` / `need.dataDirId`（同一个库根），所以不构成新的暴露面。
+ */
 export function promptStatePayload(state: PromptState): {
   choice: PromptChoice; at: string | null; by: 'tool' | 'ui' | null; declaredPapers: number | null
   fingerprint: string | null; dataDir: string | null
