@@ -246,10 +246,10 @@ const MUTATIONS = [
     why: 't2 自查修掉的缺陷：隐藏条目与产物清单重复 ⇒ 点开头论文名删除时 500 回滚' },
   // ── M 未迁移提示（t2 的新行为；靶子 = test/migrate-prompt.test.mjs，改回缺陷态必须变红）──
   { id: 'M1-ask-once-removed', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P6 ',
-    from: "  if (state.choice === 'asked' || state.choice === 'later') {", to: "  if (false) {",
+    from: "    if (state.fingerprint && state.fingerprint === need.fingerprint) {", to: "    if (false) {",
     why: '去掉 ask-once 判断（每次都问）：同一 fingerprint 第二次调用又会 ask' },
   { id: 'M2a-no-scan-trust-marker', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P3 ',
-    from: "  } else state = markers.done || paperDirs > 0 ? 'migrated' : 'empty'", to: "  } else state = markers.done ? 'migrated' : 'unmigrated'",
+    from: "  } else state = paperDirs > 0 ? 'migrated' : 'empty'", to: "  } else state = markers.done ? 'migrated' : 'unmigrated'",
     why: '只看标记（没有 .done 就当未迁移）⇒ 无标记但已是新布局被误报' },
   { id: 'M2b-trust-done-marker', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P8 ',
     from: "    if (byClass.flat > 0 && markers.done) state = 'marker-mismatch'", to: "    if (byClass.flat > 0 && markers.done) state = 'migrated'",
