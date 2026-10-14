@@ -12,6 +12,16 @@ import { resolveRerankClient, resolveShortlistSize, rerankHits, type RerankConfi
 import { completeStep, formatStudy, readStudy, recordQuiz, setPlan } from './study.ts'
 import { readerOrigin } from './origin.ts'
 import { resolveMineruConfig, type MineruConfig } from './mineru-config.ts'
+import { formatMigrationReport, planMigration } from './migrate.ts'
+import {
+  detectMigrationNeed,
+  promptStatePayload,
+  resetPromptState,
+  takeMigrationPrompt,
+  writePromptState,
+  type MigrationNeed,
+  type PromptLang,
+} from './migrate-prompt.ts'
 
 export interface PluginConfig {
   /** 文献库数据目录；默认 ~/.dsh-paper-reader/data */
@@ -95,6 +105,101 @@ const readerUrlSchema = {
 /** render 文本尾部统一带出的链接基址行（preset 规定了用法，这里只暴露值）。 */
 const readerUrlLine = (url: string | null) => (url ? `\n阅读器链接基址：${url}` : '')
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   对话侧「未迁移提示」入口（冻结方案 docs/migrate-prompt-plan.md §2）
+   · 判据**实际扫目录**（detectMigrationNeed），不是只看 .migration-v1.done 标记；
+   · `ask` 一旦给出，服务端立刻写 `choice='asked'` + 指纹 ⇒ 同一指纹第二次绝不再问（红线②）；
+   · 判据任何异常都降级 silent、不写偏好（红线③④），故这里**不需要** try/catch 包一层。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/** 提示文案语言（工具输出默认中文；DPR_MIGRATE_PROMPT_LANG=en 可切英文，供 en 文案验收用）。 */
+function promptLang(): PromptLang {
+  return process.env['DPR_MIGRATE_PROMPT_LANG']?.trim() === 'en' ? 'en' : 'zh'
+}
+
+/** 干跑报告进工具结果的字符上限（超长截断并注明——工具返回不该被一份报告撑爆）。 */
+const MIGRATION_REPORT_LIMIT = 8000
+
+/** `silent` 时也保留全部字段（便于断言），只是 `text=''`、`papers=null` 之一。 */
+interface MigrationField {
+  level: 'ask' | 'info' | 'silent'
+  reason: string
+  state: MigrationNeed['state']
+  /** `certain=false` 时 **null**（不显示篇数以免误导）；`silent` 时为 0 */
+  papers: number | null
+  files: number | null
+  migratable: number | null
+  byClass: MigrationNeed['byClass']
+  certain: boolean
+  markerSync: MigrationNeed['markerSync']
+  fingerprint: string
+  reportTool: 'migration_report'
+  askOnce: boolean
+  text: string
+  ask_hint: string | null
+}
+
+/** 计算并「取用」一次提示（ask ⇒ 写 asked）。两个工具共用，走同一份缓存与同一份偏好。 */
+function migrationField(dataDir: string): MigrationField {
+  const need = detectMigrationNeed(dataDir)
+  const taken = takeMigrationPrompt(need, { lang: promptLang(), by: 'tool' })
+  const known = need.certain
+  return {
+    level: taken.level,
+    reason: taken.reason,
+    state: need.state,
+    papers: known ? need.papers : null,
+    files: known ? need.files : null,
+    migratable: known ? need.migratable : null,
+    byClass: need.byClass,
+    certain: known,
+    markerSync: need.markerSync,
+    fingerprint: need.fingerprint,
+    reportTool: 'migration_report',
+    askOnce: taken.level === 'ask',
+    text: taken.text,
+    ask_hint: taken.askHint,
+  }
+}
+
+const nullableInt = { oneOf: [{ type: 'integer' }, { type: 'null' }], required: true } as const
+
+/** 两个工具共用的 `migration` 输出字段声明（`output.schema` 是 additionalProperties:false，必须登记）。 */
+const migrationSchema = {
+  type: 'object',
+  required: true,
+  properties: {
+    level: {
+      type: 'string', required: true, enum: ['ask', 'info', 'silent'],
+      description: 'ask=请 agent 用一句话询问用户是否迁移；info=只说明情况（不问）；silent=不必提。',
+    },
+    reason: { type: 'string', required: true, description: 'level 的机器可读原因（unmigrated/already-asked/declined/needs-manual/unreadable…）。' },
+    state: { type: 'string', required: true, description: '未迁移态：unmigrated/residue/partial/marker-mismatch/needs-manual/migrated/empty/unknown。' },
+    papers: { ...nullableInt, description: '还有 N 篇论文留在旧（平铺）位置（certain=false 时为 null）。' },
+    files: { ...nullableInt, description: '这些论文留在平铺位置的产物文件数（certain=false 时为 null）。' },
+    migratable: { ...nullableInt, description: '迁移真正能收口的篇数（flat+residue）；只剩 conflict/quarantine 时为 0。' },
+    byClass: {
+      type: 'object', required: true,
+      properties: {
+        flat: { type: 'integer', required: true }, residue: { type: 'integer', required: true },
+        conflict: { type: 'integer', required: true }, quarantine: { type: 'integer', required: true },
+      },
+      additionalProperties: false,
+    },
+    certain: { type: 'boolean', required: true, description: '判据是否完整（false=有子树读不进去或超扫描预算 ⇒ 不得据此报数）。' },
+    markerSync: { type: 'string', required: true, enum: ['none', 'conflict', 'stale'], description: '迁移标记与实际扫描的关系（conflict=标记说完成但磁盘还有平铺）。' },
+    fingerprint: { type: 'string', required: true, description: '当前库形态的指纹（含分类）；用于「同一情况不重复问」。' },
+    reportTool: { type: 'string', required: true, description: '取只读干跑报告的工具名。' },
+    askOnce: { type: 'boolean', required: true, description: 'level=ask 时为 true：服务端已记为「问过一次」，同一 fingerprint 不会再问。' },
+    text: { type: 'string', required: true, description: '要原样带给用户的提示文本（silent/info 的「不打扰」情形为空串）。**执行迁移只能在界面**，对话侧没有执行入口。' },
+    ask_hint: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true, description: '仅 level=ask 时给出的「怎么问」指令；其余为 null。' },
+  },
+  additionalProperties: false,
+} as const
+
+/** `text` 非空时把提示追加到工具文本末尾（silent/info 的空文本不追加空行）。 */
+const migrationLine = (m: { text?: string } | undefined) => (m?.text ? `\n\n${m.text}` : '')
+
 /** 4 个 source 值的文案（§10.1：不得把 MinerU 结果误报成「本地提取」）。 */
 function sourceLabel(source: string): string {
   switch (source) {
@@ -143,21 +248,24 @@ export function registerTools(ctx: Context, config: PluginConfig) {
             items: { type: 'string', description: '形如 专题/文献名' },
             description: '文献列表。',
           },
+          migration: migrationSchema,
         },
         additionalProperties: false,
       },
       render: (_args, value) => [
         {
           type: 'text',
-          text: value.papers.length === 0
+          text: (value.papers.length === 0
             ? `文献库为空（${value.dataDir}）。把 PDF 放进 <专题>/ 目录即可。`
-            : `文献库（${value.dataDir}）：\n${value.papers.map((p) => `- ${p}`).join('\n')}`,
+            : `文献库（${value.dataDir}）：\n${value.papers.map((p) => `- ${p}`).join('\n')}`)
+            // 提示只**追加**在末尾：绝不改 papers/tree 的内容与顺序，也不影响任何既有行为（红线③）
+            + migrationLine(value.migration),
         },
       ],
     },
-    execute: async (args, exec) => {
+    execute: async (args) => {
       const papers = listPapers(dataDir, args.topic).map((p) => `${p.topic}/${p.name}`)
-      return { dataDir, topics: listTopics(dataDir), papers }
+      return { dataDir, topics: listTopics(dataDir), papers, migration: migrationField(dataDir) }
     },
   }))
 
@@ -200,6 +308,7 @@ export function registerTools(ctx: Context, config: PluginConfig) {
             description: '实际 MinerU backend（本地）或 modelVersion（云端）；非 MinerU 为 null。',
           },
           readerUrl: readerUrlSchema,
+          migration: migrationSchema,
         },
         additionalProperties: false,
       },
@@ -213,7 +322,8 @@ export function registerTools(ctx: Context, config: PluginConfig) {
               ? ` 引擎：${producerLabel(value.producer)}${value.backend ? `（${value.backend}）` : ''}。`
               : '') +
             `接下来可用 search_paper 检索具体内容。` +
-            readerUrlLine(value.readerUrl),
+            readerUrlLine(value.readerUrl) +
+            migrationLine(value.migration),
         },
       ],
     },
@@ -231,6 +341,8 @@ export function registerTools(ctx: Context, config: PluginConfig) {
         producer: t.producer,
         backend: t.backend,
         readerUrl: readerUrl(ref),
+        // 次入口：覆盖「打开/读某篇论文」这条路径（同一次扫描，走缓存；ask 仍由服务端写 asked）
+        migration: migrationField(dataDir),
       }
     },
   }))
@@ -516,6 +628,203 @@ export function registerTools(ctx: Context, config: PluginConfig) {
         record = await recordQuiz(ref, args.score, args.total, args.summary)
       }
       return { paper: `${ref.topic}/${ref.name}`, summary: formatStudy(record) }
+    },
+  }))
+
+  /* ── 只读干跑报告（§2.4）：用户答「要」之后给报告；**没有任何执行路径** ─────────────────────
+     执行唯一入口在界面（设置 → 论文伴读 → 查看迁移报告，需人手输入 migrate 确认）或 CLI --apply --yes。
+     本工具连 `runMigration` 都不 import ⇒ 「改回缺陷态」的变异（M5）必然让 P16 变红。 */
+  // ⚠️ dsh-tools 的 value schema DSL 不支持 `oneOf` 成员对象上的 `required: true`
+  //（`oneOf[0].required is not supported`）⇒ needSchema 本体不带 required，由外层属性声明需求。
+  const needSchema = {
+    type: 'object',
+    properties: {
+      state: { type: 'string', required: true }, papers: { type: 'integer', required: true },
+      files: { type: 'integer', required: true }, migratable: { type: 'integer', required: true },
+      orphans: { type: 'integer', required: true }, paperDirs: { type: 'integer', required: true },
+      certain: { type: 'boolean', required: true },
+      markerSync: { type: 'string', required: true, enum: ['none', 'conflict', 'stale'] },
+      fingerprint: { type: 'string', required: true },
+      byClass: {
+        type: 'object', required: true,
+        properties: {
+          flat: { type: 'integer', required: true }, residue: { type: 'integer', required: true },
+          conflict: { type: 'integer', required: true }, quarantine: { type: 'integer', required: true },
+        },
+        additionalProperties: false,
+      },
+      markers: {
+        type: 'object', required: true,
+        properties: { done: { type: 'boolean', required: true }, partial: { type: 'boolean', required: true } },
+        additionalProperties: false,
+      },
+      unreadable: {
+        type: 'array', required: true,
+        items: {
+          type: 'object',
+          properties: { dir: { type: 'string', required: true }, cause: { type: 'string', required: true } },
+          additionalProperties: false,
+        },
+      },
+    },
+    additionalProperties: false,
+  } as const
+
+  ctx.tools.register(defineTool({
+    name: 'migration_report',
+    description:
+      '只读干跑报告：扫描文献库并列出「旧（平铺）→ 按论文分文件夹」需要收口的论文/文件、' +
+      '冲突与跳过项、读不进去的子树。**只读：不修改任何文件，也绝不执行迁移**；' +
+      '执行只能在阅读器/设置面板里由用户确认（需要输入 migrate）。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', required: true },
+          dataDir: { type: 'string', required: true },
+          report: { type: 'string', required: true, description: '人类可读干跑报告（超过 8000 字符时截断，truncated=true）。' },
+          truncated: { type: 'boolean', required: true },
+          need: { oneOf: [needSchema, { type: 'null' }], required: true, description: '判据结果；读不到库时为 null。' },
+          plan: {
+            oneOf: [
+              {
+                type: 'object',
+                properties: {
+                  moves: { type: 'integer', required: true },
+                  alreadyDone: { type: 'integer', required: true },
+                  orphans: { type: 'integer', required: true },
+                  totals: {
+                    type: 'object', required: true,
+                    properties: {
+                      papers: { type: 'integer', required: true }, files: { type: 'integer', required: true },
+                      bytes: { type: 'integer', required: true }, needBytes: { type: 'integer', required: true },
+                    },
+                    additionalProperties: false,
+                  },
+                  conflicts: {
+                    type: 'array', required: true,
+                    items: {
+                      type: 'object',
+                      properties: { paper: { type: 'string', required: true }, target: { type: 'string', required: true }, reason: { type: 'string', required: true } },
+                      additionalProperties: false,
+                    },
+                  },
+                  quarantine: {
+                    type: 'array', required: true,
+                    items: {
+                      type: 'object',
+                      properties: { paper: { type: 'string', required: true }, reason: { type: 'string', required: true } },
+                      additionalProperties: false,
+                    },
+                  },
+                  unreadable: {
+                    type: 'array', required: true,
+                    items: {
+                      type: 'object',
+                      properties: { dir: { type: 'string', required: true }, cause: { type: 'string', required: true } },
+                      additionalProperties: false,
+                    },
+                  },
+                },
+                additionalProperties: false,
+              },
+              { type: 'null' },
+            ],
+            required: true,
+          },
+          error: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true, description: '读库失败原因（未做任何改动）。' },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        if (!value.ok) {
+          return [{ type: 'text', text: `无法读取文献库：${value.error ?? '未知原因'}（未做任何改动）` }]
+        }
+        return [{
+          type: 'text',
+          text: value.report + (value.truncated ? '\n（已截断，完整报告见 设置 → 论文伴读 → 查看迁移报告）' : '') +
+            '\n以上为只读报告，未改动任何文件。执行入口：设置 → 论文伴读 → 查看迁移报告（需输入 migrate 确认）；我不会自动执行。',
+        }]
+      },
+    },
+    execute: async () => {
+      try {
+        const plan = planMigration(dataDir)
+        const report = formatMigrationReport(plan)
+        const truncated = report.length > MIGRATION_REPORT_LIMIT
+        return {
+          ok: true,
+          dataDir,
+          report: truncated ? report.slice(0, MIGRATION_REPORT_LIMIT) : report,
+          truncated,
+          need: detectMigrationNeed(dataDir, { force: true }),
+          plan: {
+            moves: plan.moves.length,
+            alreadyDone: plan.alreadyDone.length,
+            orphans: plan.orphans.length,
+            totals: plan.totals,
+            conflicts: plan.conflicts,
+            quarantine: plan.quarantine,
+            unreadable: plan.unreadable,
+          },
+          error: null,
+        }
+      } catch (err) {
+        return {
+          ok: false, dataDir, report: '', truncated: false, need: null, plan: null,
+          error: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
+  }))
+
+  /* ── 只写偏好（§2.4）：**绝不迁移任何文件、不读库内容**（除非重算指纹需要扫目录，见下） ── */
+  ctx.tools.register(defineTool({
+    name: 'migration_prompt_choice',
+    description:
+      '记录用户对「是否迁移文献库布局」的回答。**只写提示偏好，绝不迁移任何文件**。' +
+      '仅在用户明确回答后调用：later=以后再说（库变化时可再问一次）；declined=不再提醒（除「重新检查」外永不问）；' +
+      'recheck=重新检查（清掉之前的回答，允许再问一次）。',
+    parameters: {
+      choice: { type: 'string', required: true, enum: ['later', 'declined', 'recheck'], description: '用户的回答。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', required: true },
+          choice: { type: 'string', required: true, enum: ['idle', 'asked', 'later', 'declined'] },
+          willAsk: { type: 'boolean', required: true, description: '之后是否还可能主动问一次（declined=false，其余=true）。' },
+          note: { type: 'string', required: true },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: value.note }],
+    },
+    execute: async (args) => {
+      if (args.choice === 'recheck') {
+        const state = resetPromptState()
+        return { ok: true, choice: state.choice, willAsk: true, note: '已重新检查：下次若库里仍有旧布局，会再提示一次（仍然只提示，不会自动迁移）。' }
+      }
+      // 指纹要跟着写：`later` 的语义是「同一情况不再问、库变了可以再问」——不写指纹就会立刻再问一次
+      const need = detectMigrationNeed(dataDir)
+      const written = writePromptState({
+        choice: args.choice,
+        at: new Date().toISOString(),
+        by: 'tool',
+        declaredPapers: need.papers,
+        fingerprint: need.fingerprint,
+      })
+      const payload = promptStatePayload(written.state)
+      return {
+        ok: written.ok,
+        choice: payload.choice,
+        willAsk: args.choice !== 'declined',
+        note: args.choice === 'declined'
+          ? '已记录「不再提醒」：之后不会再主动问（设置 → 论文伴读 → 重新检查 可以恢复）。'
+          : '已记录「以后再说」：同一情况不会再问；若库有变化会再提示一次。',
+      }
     },
   }))
 }

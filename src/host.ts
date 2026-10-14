@@ -95,6 +95,15 @@ import {
   rollbackMigration,
   runMigration,
 } from './migrate.ts'
+import {
+  decideMigrationPrompt,
+  detectMigrationNeed,
+  invalidateMigrationPromptCache,
+  promptStatePayload,
+  readPromptState,
+  resetPromptState,
+  writePromptState,
+} from './migrate-prompt.ts'
 import { noteOrigin } from './origin.ts'
 import {
   clearThemeConfig,
@@ -488,6 +497,11 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
 
   const dispatch = async (req: Req, res: Res, url: URL) => {
     const sub = url.pathname.slice('/paper-reader'.length) // '' | '/' | '/api/...'
+
+    /* 未迁移提示的判据缓存失效（方案 §1.4）：**任何面向文献库的写操作**都可能改变布局
+       （上传/删除/改名/新建专题/清空/迁移/回滚）⇒ 下一次读取重新扫描。
+       放在分派入口一处，避免 8 个写路由各漏一处；最坏代价只是一次几十毫秒的重复扫描。 */
+    if (req.method !== 'GET' && sub.startsWith('/api/library')) invalidateMigrationPromptCache(dataDir)
 
     if ((sub === '' || sub === '/') && req.method === 'GET') {
       // no-cache：桌面端 webview 无法强刷（README 里浏览器 Cmd+Shift+R 的建议对桌面端
@@ -994,6 +1008,50 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
           if (!libFail(res, err)) throw err
         }
       })
+      return
+    }
+
+    /* ── 「未迁移提示」的只读状态与偏好（冻结方案 §3.5）─────────────────────────
+       GET  ?force=1 = 重新检查（绕过 60s 缓存）；POST 只写偏好（**绝不迁移任何文件**）；DELETE 重置为 idle。
+       判据**实际扫目录**（detectMigrationNeed），标记与磁盘不一致时如实表达（need.markerSync）。 */
+    if (sub === '/api/library/migrate-prompt' && req.method === 'GET') {
+      const force = url.searchParams.get('force') === '1'
+      const need = detectMigrationNeed(dataDir, { force })
+      const state = readPromptState()
+      const prompt = decideMigrationPrompt(need, state)
+      json(res, 200, {
+        ok: true,
+        need,
+        prompt: { level: prompt.level, reason: prompt.reason, text: prompt.text },
+        state: promptStatePayload(state),
+      })
+      return
+    }
+
+    if (sub === '/api/library/migrate-prompt' && req.method === 'POST') {
+      const body = (await readBody(req)) as { choice?: string; declaredPapers?: number; fingerprint?: string }
+      if (!['asked', 'later', 'declined', 'idle'].includes(String(body.choice))) {
+        json(res, 400, { error: 'choice 必须是 asked / later / declined / idle', code: 'bad-request' })
+        return
+      }
+      // `idle` = 「重新检查」的另一种写法（清掉回答）
+      if (body.choice === 'idle') {
+        json(res, 200, { ok: true, state: promptStatePayload(resetPromptState()), willAsk: true })
+        return
+      }
+      // 未给指纹/篇数时**保留**上一份（否则界面只发 {choice:'asked'} 会把「同一指纹不再问」的门拆掉）
+      const patch: { choice: 'asked' | 'later' | 'declined'; at: string; by: 'ui'; declaredPapers?: number; fingerprint?: string } =
+        { choice: body.choice as 'asked' | 'later' | 'declined', at: new Date().toISOString(), by: 'ui' }
+      if (typeof body.declaredPapers === 'number' && Number.isFinite(body.declaredPapers)) patch.declaredPapers = body.declaredPapers
+      if (typeof body.fingerprint === 'string' && body.fingerprint) patch.fingerprint = body.fingerprint
+      const written = writePromptState(patch)
+      const state = promptStatePayload(written.state)
+      json(res, 200, { ok: written.ok, state, willAsk: state.choice === 'idle' })
+      return
+    }
+
+    if (sub === '/api/library/migrate-prompt' && req.method === 'DELETE') {
+      json(res, 200, { ok: true, state: promptStatePayload(resetPromptState()), willAsk: true })
       return
     }
 
