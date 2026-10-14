@@ -473,7 +473,10 @@ export function decideMigrationPrompt(need: MigrationNeed, state: PromptState, o
   if (process.env['DPR_MIGRATE_PROMPT']?.trim() === 'off') return { level: 'silent', reason: 'disabled', text: '', askHint: null }
   if (need.state === 'migrated' || need.state === 'empty') return { level: 'silent', reason: need.state, text: '', askHint: null }
   if (need.state === 'unknown') {
-    // 读不进去 vs 扫描超预算：文案不同但都**不给篇数**（certain=false 时 any count 都是不完整的）
+    // §2.5 失败回退表第 1 行：**根**都读不进去（或判据抛错）⇒ 连「库里有没有论文」都不知道，
+    // 干脆完全不出声（绝不编造「可能需要迁移」）；此时 migration.error='scan-failed' 只作诊断字段。
+    // §1.2/§1.3：只是**子**树读不进去（F7 那种）⇒ 给无篇数的中性说明、不发问、不写偏好。
+    if (need.unreadable.some((u) => u.dir === '.')) return { level: 'silent', reason: 'scan-failed', text: '', askHint: null }
     const reason = need.unreadable.length > 0 ? 'unreadable' : 'budget'
     return { level: 'info', reason, text: infoText(need, reason, lang), askHint: null }
   }

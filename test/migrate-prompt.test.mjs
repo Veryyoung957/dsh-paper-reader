@@ -544,14 +544,34 @@ test('P18 红线③：提示不阻塞旧布局——列表/打开论文照常；
     assert.equal(out.migration.level, 'info')   // 已问过 ⇒ 安静
     const ref = L.resolvePaper(lib.data, { topic: 'A', name: 'P1' })
     assert.equal(ref.pdfPath, join(lib.data, 'A', 'P1.pdf'), '旧布局打开论文照常（平铺路径回落）')
-    // 判据本身绝不抛：把整个库换成不可读目录
+    // 判据本身绝不抛：把**整个库**换成不可读目录
     if (canDenyRead) {
+      const stateFile = process.env.DPR_MIGRATE_PROMPT_STATE
+      const stateBefore = readFileSync(stateFile, 'utf8')
       chmodSync(lib.data, 0o000)
       try {
         const need = MP.detectMigrationNeed(lib.data, { force: true })
         assert.equal(need.certain, false)
         assert.equal(need.state, 'unknown')
-        assert.equal(MP.takeMigrationPrompt(need).level, 'info')
+        assert.deepEqual(need.unreadable, [{ dir: '.', cause: 'EACCES' }], '根读不进去要单列（漏掉根 = 静默当成空库）')
+        const taken = MP.takeMigrationPrompt(need)
+        assert.equal(taken.level, 'silent', '根都读不进去 ⇒ 完全不出声（方案 §2.5 第 1 行）')
+        assert.equal(taken.text, '')
+        // 界面侧那条路（GET 路由）同样不抛、同样不出声：横幅不渲染、卡片也不许说「已是新布局」
+        const boot = await bootRoutes(lib.data)
+        try {
+          const r = await boot.get('/api/library/migrate-prompt')
+          assert.equal(r.status, 200, r.txt)
+          assert.equal(r.body.prompt.level, 'silent')
+          assert.equal(r.body.prompt.reason, 'scan-failed')
+          assert.equal(r.body.need.state, 'unknown')
+        } finally { boot.srv.close() }
+        // ⚠️ 方案 §2.5 与现实的一处偏差（已回报队长）：**列表**那条路在根不可读时本来就抛 EACCES
+        //（listTopics 既有实现没有 try/catch，本批不改它——把它降级成「库为空」才是真误报）。
+        // 这里固定住这个既有行为，并证明**提示**没有引入新的失败面。
+        const tools = makeTools(lib.data)
+        await assert.rejects(() => tools.list_papers.execute({}, {}), /EACCES/, '既有行为：根不可读时列表本来就报错（与提示无关）')
+        assert.equal(readFileSync(stateFile, 'utf8'), stateBefore, '不出声的情形绝不许写偏好')
       } finally { chmodSync(lib.data, 0o755) }
     } else {
       // 平台不支持（Windows/root）：至少证明判据对「不存在的库」不抛
@@ -706,6 +726,7 @@ test('P22 界面元素：横幅/卡片/报告弹层的构件与执行门（源�
   // 状态文案选择
   assert.equal(pure.statusKey('silent', 'migrated', 'idle'), 'migMigrated')
   assert.equal(pure.statusKey('silent', 'empty', 'idle'), 'empty')
+  assert.equal(pure.statusKey('silent', 'unknown', 'idle'), null, '根读不进去 ⇒ 界面也不许说「已是新布局」')
   assert.equal(pure.statusKey('info', 'unknown', 'asked'), 'migUnknown')
   assert.equal(pure.statusKey('info', 'needs-manual', 'asked'), 'migNeedsManual')
   assert.equal(pure.statusKey('info', 'unmigrated', 'asked'), 'migBannerQuiet')

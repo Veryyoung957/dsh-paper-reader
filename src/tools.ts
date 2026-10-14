@@ -137,6 +137,8 @@ interface MigrationField {
   askOnce: boolean
   text: string
   ask_hint: string | null
+  /** §2.5 失败回退表：判据整个跑不了（根读不进去 / 抛错）时为 'scan-failed'，其余为 null。 */
+  error: string | null
 }
 
 /** 计算并「取用」一次提示（ask ⇒ 写 asked）。两个工具共用，走同一份缓存与同一份偏好。 */
@@ -159,6 +161,7 @@ function migrationField(dataDir: string): MigrationField {
     askOnce: taken.level === 'ask',
     text: taken.text,
     ask_hint: taken.askHint,
+    error: taken.reason === 'scan-failed' ? 'scan-failed' : null,
   }
 }
 
@@ -193,6 +196,7 @@ const migrationSchema = {
     askOnce: { type: 'boolean', required: true, description: 'level=ask 时为 true：服务端已记为「问过一次」，同一 fingerprint 不会再问。' },
     text: { type: 'string', required: true, description: '要原样带给用户的提示文本（silent/info 的「不打扰」情形为空串）。**执行迁移只能在界面**，对话侧没有执行入口。' },
     ask_hint: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true, description: '仅 level=ask 时给出的「怎么问」指令；其余为 null。' },
+    error: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true, description: '判据整个跑不了（根读不进去/抛错）时为 scan-failed；此时 level=silent，什么都不该说。' },
   },
   additionalProperties: false,
 } as const
