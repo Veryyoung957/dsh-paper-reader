@@ -3,6 +3,12 @@
 > 任务：t1（需求/方案轮）。作者：researcher。基线取证见 §0——**先读 §0.1，它决定 t2 从哪条分支切**。
 > 纪律：本方案**只出方案不改代码**；不 commit / 不 push；未跑真实库迁移；未改主工作区源码。
 > 产物：本文件 + `.probe/migrate-prompt/`（探针脚本与原始输出）。
+>
+> ⚠️ **UI 侧已被取代（本轮，逐条对照见 §9）**：本文 §3（界面侧入口/文案/弹层）与 §4 红线①里
+> 「键入 `migrate` 才可执行」的描述，已被**逐篇状态面板 + 警示后一次点击确认**取代（本轮设计冻结见
+> `docs/migrate-ui-requirements.md`）。**不被取代**的部分：§1–§2 的判据与对话侧提示（`list_papers` 的
+> `migration` 字段、`migration_prompt_choice`）、`migration_report` 只读工具、CLI 干跑报告与 `--apply --yes`、
+> 后端 `GET /api/library/migrate-plan` 与 `confirm:'migrate-library'` 栅栏，全部保留。
 
 ---
 
@@ -308,12 +314,17 @@ I can call migration_report (read-only) for details.
 name: migration_report
 description: 只读干跑报告：扫描文献库并列出「旧（平铺）→ 按论文分文件夹」需要收口的论文/文件、
              冲突与跳过项、读不进去的子树。**只读：不修改任何文件，也绝不执行迁移**；
-             执行只能在阅读器/设置面板里由用户确认（需要输入 migrate）。
+             执行只能在阅读器/设置面板里由用户确认（「查看论文状态」面板内警示后点一次「确认迁移」）。
 parameters: {}（库级，不分专题）
 output: { ok, dataDir, report(≤8000 字符，超出截断并注明), need:<MigrationNeed>, plan:{moves,alreadyDone,conflicts,quarantine,orphans,unreadable,totals}, error? }
 render: report 原文 + 固定尾句：
-        「以上为只读报告，未改动任何文件。执行入口：设置 → 论文伴读 → 查看迁移报告（需输入 migrate 确认）；我不会自动执行。」
+        「以上为只读报告，未改动任何文件。执行入口：设置 → 论文伴读 → 查看论文状态（在警示后点一次「确认迁移」）；我不会自动执行。」
 ```
+
+> ⚠️ **已被取代（本轮，见 §9）**：上面两处原文分别是「执行只能在阅读器/设置面板里由用户确认（需要输入
+> migrate）」与「执行入口：设置 → 论文伴读 → 查看迁移报告（需输入 migrate 确认）」——键入确认已被逐篇状态
+> 面板的**警示后一次点击**取代，入口名改为**「查看论文状态」**。`migration_report` 工具本身、它的只读性质
+> 与尾句承诺「我不会自动执行」全部保留（真实实现见 `src/tools.ts` 的 `migration_report`）。
 
 流程（对话侧，冻结）：
 
@@ -323,7 +334,7 @@ render: report 原文 + 固定尾句：
 用户回「要」
   → agent 调 migration_report（只读）→ 把 report 的**要点**贴回对话：
      「待迁移 3 篇 / 9 个文件 / 需额外空间约 7697 字节；冲突 0、跳过 0、未处理子树 0」
-  → 并告诉用户执行入口：「去 设置 → 论文伴读 → 查看迁移报告，输入 migrate 确认执行」（或 CLI：node dist/migrate.js --data-dir <库> [--apply --yes]）
+  → 并告诉用户执行入口：「去 设置 → 论文伴读 → 查看论文状态」，在面板警示后点一次「确认迁移」（原措辞「查看迁移报告，输入 migrate 确认执行」已被取代，见 §9）；或 CLI：node dist/migrate.js --data-dir <库> [--apply --yes]
   → **对话侧到此为止**：agent 没有任何执行路径（现状 grep 已确认；本方案不新增执行工具）
 用户在界面确认 → 界面 POST /api/library/migrate {confirm:'migrate-library'} → 执行 → 刷新状态
 ```
@@ -358,13 +369,20 @@ output: { ok, state:{choice,at,declaredPapers,fingerprint}, willAsk:boolean }
 
 | 表面 | 位置（file:line） | 何时显示 | 作用 |
 |---|---|---|---|
-| **S1 侧栏横幅（主）** | `lib/client.js` 的 `LibraryTree` wide 分支：`S.head`（`:1353-1358`）之后、树行（`:1367`）之前插入 `h(MigrationBanner,null)`（约 `:1359`）；`data-dsh-part="migration-banner"` | `level='ask'/'info'` 且 `choice∈{idle,asked,later}`；`level='silent'` 或 `choice='declined'` 时**不渲染** | 用户浏览文献库时当场可见；按钮「查看迁移报告」「以后再说」 |
-| **S2 设置卡片（常驻 + 重新检查）** | `SettingsPanel`（`:1690-1708`）里加 `h(MigrationCard,null)`（放最前：它是**状态**不是配置）；slot 注册见 `:1856-1859` | 始终渲染 | 状态行（未迁移 N 篇 / 已迁移 / 无法判定 / 已选择暂不迁移）+ 「查看迁移报告」+「重新检查」+「不再提醒」 |
+| **S1 侧栏横幅（主）** | `lib/client.js` 的 `LibraryTree` wide 分支：`S.head`（`:1353-1358`）之后、树行（`:1367`）之前插入 `h(MigrationBanner,null)`（约 `:1359`）；`data-dsh-part="migration-banner"` | `level='ask'/'info'` 且 `choice∈{idle,asked,later}`；`level='silent'` 或 `choice='declined'` 时**不渲染** | 用户浏览文献库时当场可见；按钮「查看论文状态」「以后再说」 |
+| **S2 设置卡片（常驻 + 重新检查）** | `SettingsPanel`（`:1690-1708`）里加 `h(MigrationCard,null)`（放最前：它是**状态**不是配置）；slot 注册见 `:1856-1859` | 始终渲染 | 状态行（未迁移 N 篇 / 已迁移 / 无法判定 / 已选择暂不迁移）+ 「查看论文状态」+「重新检查」+「不再提醒」 |
 | **S3 阅读器条（P2，可选）** | `reader/index.html`：`#bar`（`:214-242`）之后、`#main`（`:243-245`）之前插 `#migrate-banner`；数据走既有 `api()`（`:389`） | 同上 | 阅读时也能看见。**本批不做**：阅读器无 i18n 词典（`:2` `lang="zh"`，双语只能 inline，见 `:223`/`:2266-2267`），且布局是**库级**问题、与「正在读哪篇」无关；先做 S1+S2 可少一个分叉面 |
 
 rail 态（侧栏收起，`:1347-1351`）不显示横幅（36px 图标位放不下），由 S2 兜底。
 
+> ⚠️ **已被取代（本轮，见 §9）**：表中两个表面的入口按钮名由「查看迁移报告」改为**「查看论文状态」**
+> （表中已就地改名，旧名记在此处）。显示门（`level='ask'/'info'`、`choice` 门控）、设置卡片的常驻性、
+> 「重新检查 / 不再提醒」、S3 阅读器条本批不做——全部保留。
+
 ### 3.2 文案（zh/en 双份，键名与 en 逐字冻结）
+
+> ⚠️ **本表的 UI 键已被本轮取代（本节末注记 + §9）**：删死键 / 改写 / 新增的完整清单见表后注记，
+> 键名与文案以设计文档 §3.4 为准；下表原文保留作历史对照。
 
 新增键（zh 加在 `lib/client.js:92-193`、en 加在 `:194-285`；`t()` 见 `:287-288`）：
 
@@ -394,15 +412,37 @@ rail 态（侧栏收起，`:1347-1351`）不显示横幅（36px 图标位放不�
 
 （实现时用同一套键名，测试按 `test/darkmode-subtopic-features.test.mjs:352-364` 的写法正则断言 zh/en 都在。）
 
-### 3.3 「查看迁移报告」弹层
+> ⚠️ **已被取代（本轮，见 §9）**：本表的 UI 键有增删改，键名与文案以本轮冻结的新键清单为准（设计文档 §3.4）。
+> 下表原文保留，用于对照「当时为什么这么写」：
+> · **删死键**：`migViewReport`（新键 `migViewStatus`）、`migReportTitle`、`migReportIntro`、`migConfirmHint`、
+>   `migReportFail`；`migReportManual` 改为 `migManualNote`。
+> · **改写**：`migBannerDesc`（不再承诺「先给一份只读干跑报告」）、`migExecute`/`migExecuting`/`migExecPartial`、
+>   `migDone`（以刷新后的逐篇状态为准）、`migNeedsManual`（中性「需人工处理，迁移会跳过」——含 quarantine，
+>   不能只说同名冲突）。
+> · **保留**：`migBannerAsk`/`migBannerQuiet`、`migMarkerMismatch`、`migUnknown`、`migMigrated`、
+>   `migDeclinedRow`、`migLater`/`migNever`/`migRecheck` 与真实删除/恢复/busy 文案。
+> · **新增**：`migStatusTitle`/`migStatusDesc`/`migPending`/`migManualNote`、面板列头 `statusPaper`/
+>   `statusTranslation`/`statusMineru`/`statusMigration`、三态 `statusComplete`/`statusIncomplete`/
+>   `statusUnknown`、`statusScope`/`statusUnreadable`/`migWarning`/`migNotExecutable`/`migExecFail`、
+>   删除与清空的 `delTopicWarning`/`delWarning`（`delTopicTypeName` 删除）。
+
+### 3.3 「查看迁移报告」弹层（⚠️ 整体已被取代，见 §9）
+
+> ⚠️ **整体已被取代（本轮，见 §9）**：弹层不再是「`<pre>` 文字报告 + 逐篇 skipped/失败原因 + 键入 `migrate`」，
+> 而是**逐篇状态面板**（每篇论文的 翻译 / MinerU 转录 / 迁移 三态 + 「待迁移 N 篇 / 其中 M 篇需人工处理」
+> + 警示 + 一次点击「确认迁移」）。下面的旧描述只作历史对照；**仍然有效**的是：`GET /api/library/migrate-plan`
+> 只读预检路由、`POST /api/library/migrate {confirm:'migrate-library'}` 服务端栅栏（仅由用户点击携带）、
+> 执行结果取 `r.copied/skipped/removed/dirsRemoved/logPath`、失败原样显示且不自动重试。
 
 - 打开：`GET /api/library/migrate-plan`（`src/host.ts:938-946`，**已存在，只读**）→ `{ok, plan, report}`。
 - 内容：顶部 `migReportIntro` 用 `plan.totals` 填；主体 `<pre>` 渲染 `report`（等宽、`max-height:60vh`、可滚动）；
   `conflicts/quarantine/unreadable` 非空时**在顶部单独一行警告**（这三类是「不会被自动收口」的部分）。
 - 按钮（`SET.row` + `SET.btn/btnGhost`，`lib/client.js:1527-1529`）：
   - `以后再说`（写 `later`）/`不再提醒`（写 `declined`）；
-  - `确认执行迁移`：**默认 disabled**，仅在输入框内容 === `migrate` 时启用 → `POST /api/library/migrate {confirm:'migrate-library'}`（`:948-971`）。
-    这一步是「用户确认」的**唯一**入口，也是红线①的结构性保证（模型没有这个输入框）。
+  - `确认迁移`（原 `确认执行迁移`）：加载中/检查失败/状态未知/无可迁移项时 disabled 并说明原因，
+    `need.certain && need.migratable > 0` 时可点 → `POST /api/library/migrate {confirm:'migrate-library'}`（`:948-971`）。
+    **已取代**：原为「`确认执行迁移`：**默认 disabled**，仅在输入框内容 === `migrate` 时启用」——键入与
+    输入框已取消（见 §9）。这一步仍是「用户确认」的**唯一**入口，也是红线①的结构性保证（模型没有这个点击）。
 - 执行结果：
   - `200` → `migExecuting` → 成功：`已迁移 N 篇…`（用 `r.copied/skipped/removed/dirsRemoved/logPath`，`src/migrate.ts:75-93`）；刷新 → 横幅消失；
   - `200 + partial:true` → 显示 `migExecPartial{n=skippedPapers.length}` + `skippedPapers` 列表（`:88-91`），横幅转 `needs-manual`；
@@ -466,18 +506,23 @@ UI 侧行为矩阵（冻结；t3 按此逐格验）：
 
 > 「ask 的写盘时机」= 横幅**渲染出询问文案**后立即 `POST{choice:'asked', fingerprint, declaredPapers}`；
 > 对话侧的 ask 由工具调用时写。两者共用同一状态 ⇒ **同一时间内不会两边同时问**。
+>
+> ⚠️ **本轮取代（见 §9）**：上面矩阵里的 `migViewReport` 一律按新键 `migViewStatus`（入口改为**逐篇状态面板**）读；
+> 门控（`level`×`choice` 矩阵、写 `asked` 的时机、同指纹去重）**全部不变**；`migBannerDesc`/`migNeedsManual`
+> 等文案的改写见 §3.2 注记。
 
 ---
 
 ## 4. 四条红线（机制 / 证据 / 变异靶子）
 
-### 红线① 只提示，绝不自动迁移（执行仍须 干跑 → 报告 → 用户确认）
+### 红线① 只提示，绝不自动迁移（执行仍须 只读预检 → 用户确认；确认方式本轮改为一次点击，见 §9）
 
 - **机制**：对话侧工具层**没有任何**执行路径（现状 `grep -n "migrate\|runMigration" src/tools.ts src/index.ts` 为空，基线树实测）；
   本方案新增的两个工具：`migration_report` 只调用 `planMigration()`（`src/migrate.ts:157-321` 全部是 `readdir/lstat/readFileSync`，纯只读），
   `migration_prompt_choice` 只写 `$DSH_HOME` 下的偏好文件（库外、不碰库）。
   执行需要**两道门同时过**：HTTP `confirm:'migrate-library'`（`src/host.ts:950`）或 CLI `--yes`（`src/migrate.ts:720`），
-  而 UI 侧的 `confirm` 只能由用户在输入框里键入 `migrate` 得到（§3.3）。
+  而 UI 侧的 `confirm` 只能由用户在逐篇状态面板的警示后**点一次「确认迁移」**得到（已取代原「在输入框里
+  键入 `migrate`」，见 §9）。
 - **证据**：`GET /api/library/migrate-plan` 走 `planMigration`（`:938-946`）；POST 缺 confirm 直接 400（`:950-952`）；CLI 缺 `--yes` 退出码 64（`:720-723`）。
 - **变异靶子**：把 `migration_report` 内部改成调用 `runMigration`；或把 POST 的 confirm 检查删掉 ⇒ 用例「调用三个新工具后夹具库**逐字节不变**、且无 `migration-logs/` 新文件」必须变红。
 
@@ -534,7 +579,7 @@ UI 侧行为矩阵（冻结；t3 按此逐格验）：
 | P19 | 红线④ | 只读挂载（库目录 0o555 + `DSH_HOME` 只读）⇒ 不误报、不抛、不写 |
 | P20 | 缓存与失效 | 同进程第二次调用不再走扫描（计数器断言）；迁移执行成功后缓存失效 |
 | P21 | i18n | 新增 zh/en 键两套齐全（沿用 `:352-364` 的正则断言） |
-| P22 | 界面元素 | 横幅/卡片/报告弹层的 `data-dsh-part`、按钮文案、确认输入门（未输入 `migrate` 时执行按钮 disabled） |
+| P22 | 界面元素（**本轮已修订**） | 横幅/卡片/**逐篇状态面板**（`data-part=paper-status-panel`）的 `data-dsh-part`、按钮文案、**无输入框**；加载中/失败/未知/`migratable=0` 时执行按钮 disabled 并说明，可迁移时**单击只发一个 POST** 且 `confirm` 令牌保留（原为「报告弹层 + 未输入 `migrate` 时执行按钮 disabled」，见 §9） |
 | P23 | 键不会被搬 | 改论文名/专题名后 `dpr.migratePrompt` 仍在（复用既有 `migrateLsKeys` 断言套路） |
 
 **变异验证（写进 `test/mutation-probe.mjs`，改回缺陷态必须对应用例变红）**：
@@ -570,7 +615,7 @@ UI 侧行为矩阵（冻结；t3 按此逐格验）：
 
 ## 7. 明确不做 / 延后
 
-1. **不做任何自动迁移**，不做「一键迁移」按钮（必须输入 `migrate` 确认）。
+1. **不做任何自动迁移**，也不做无警示的一键执行（**本轮修订**）：迁移只在逐篇状态面板的明确警示后由用户**单击一次**「确认迁移」触发；原「不做一键迁移按钮（必须输入 `migrate` 确认）」中的键入确认已取消（见 §9）。
 2. **不动运行期布局读取分支**（legacy 双读保留，上一批 Z.4 第 3 条裁定）。
 3. **不做回滚 UI**（路由已存在 `src/host.ts:973-998`，P2 再接）。
 4. **不把提示铺到 `search_paper`/`study_progress`**（P2：接入点一行，helper 已共用）。
@@ -583,7 +628,7 @@ UI 侧行为矩阵（冻结；t3 按此逐格验）：
 
 | 备选 | 否决理由 |
 |---|---|
-| A1 给对话 agent 一个「执行迁移」工具（带 `confirm` 参数） | 参数由模型自己填 ⇒ 不是用户确认；违背红线①，且 t4 的旁路探针必然打出缺口。执行只留在界面（需人手输入 `migrate`） |
+| A1 给对话 agent 一个「执行迁移」工具（带 `confirm` 参数） | 参数由模型自己填 ⇒ 不是用户确认；违背红线①，且 t4 的旁路探针必然打出缺口。执行只留在界面（原「需人手输入 `migrate`」；本轮改为面板警示后一次点击，见 §9） |
 | A2 判据只看 `.migration-v1.done` / `.partial` | 探针实测 F3/F8/F11 漏报、F4 误报（§0.3） |
 | A3 判据直接用 `planMigration()`（含 sha256） | 只采纳「报告用它」；提示判据用 size 级扫描（12 个夹具零差异），避免每次读全库字节与 IO 错误面 |
 | A4 偏好只存 localStorage | 对话侧（工具进程）读不到；UI 拒绝后对话仍会问 = 破红线② |
@@ -632,6 +677,10 @@ residue（文件夹 + 平铺各一份，会触发 sha256）    2.2            61
 理由：同一屏上两个数字（横幅「还有 3 篇」vs 弹层「待迁移 0 篇」）就是构造性说谎。
 **这条取舍属产品定义，请用户拍板**：备选是「可自动收口 migratable 篇 / 待人工 conflict+quarantine 篇」
 双数字（信息更全但更长），或保留 `plan.totals` 但在顶部标注口径。当前实现是前者（同源 + 注记）。
+
+> ⚠️ **本轮同步（见 §9）**：N/M 同源口径**保留**（N=`need.papers`、M=`conflict+quarantine`）；但这条注记的
+> 落点已不是报告弹层顶部，而是逐篇状态面板的汇总行；键名由 `migReportManual` 改为 `migManualNote`；
+> `{bytes}/{conflicts}/{quarantine}/{unreadable}` 仍取干跑报告。
 
 ### 8.2 发问门增加「库身份」这个正交轴（队长裁定 b）
 
@@ -698,3 +747,39 @@ declined 下也会重新问一次；若产品上要求「declined 对机器上�
 - **F10（方法学记录项）**：`test/mutation-probe.mjs` 有多条**多行**锚点，必须**在 LF 检出**里运行
   （`core.autocrlf=true` 的 CRLF 检出会让锚点「命中 0 次」⇒ 显式 FAIL，不会静默）。已写进该文件头部。
   t4 评审一度据此误报「44/64」，补建真 LF 检出后复跑为 **64/64**（已撤回）。
+
+---
+
+## 9. UI 同步（本轮：逐篇状态面板取代「文字报告弹层 + 键入 migrate」）
+
+> 本轮设计冻结见 `docs/migrate-ui-requirements.md`（§2 三轴状态契约、§3.2 三表面、§3.3 警示 + 一次点击、
+> §3.4 zh/en 新键）。本节只做两件事：把**被取代的旧冻结陈述**如实标注（原文一律保留，不删历史），
+> 并写明**取代后的做法**。本节未列出的条款——判据（§1）、对话侧提示与偏好路由（§2/§3.5）、
+> `migration_report` / `migration_prompt_choice`、CLI、四条红线中的②③④——继续有效。
+
+| 旧条款（本文位置） | 状态 | 现在的做法 |
+|---|---|---|
+| §2.4 `migration_report` 描述尾句「执行只能在阅读器/设置面板里由用户确认（需要输入 migrate）」 | 已取代（原文见 §2.4 上方注记） | 执行入口仍是界面，确认方式改为**逐篇状态面板警示后点一次「确认迁移」**；工具描述已同步（`src/tools.ts`） |
+| §2.4 报告 render 尾句「执行入口：… 查看迁移报告（需输入 migrate 确认）」 | 已取代 | 同一次点击；入口名改为**「查看论文状态」**。agent 只读报告本身保留，尾句「我不会自动执行」保留 |
+| §2.4 对话侧流程末步「去看迁移报告，输入 migrate 确认执行」 | 已取代 | 改为「去 设置 → 论文伴读 → 查看论文状态」，警示后点一次「确认迁移」；CLI `--apply --yes` 不变 |
+| §3.1 两个表面的入口按钮名「查看迁移报告」 | 已取代（表中已改名） | 「查看论文状态」；显示门、设置卡片常驻性、偏好按钮、S3 不做——全部保留 |
+| §3.2 `migViewReport` / `migReportTitle` / `migReportIntro` / `migConfirmHint` / `migReportFail` | 死键，已删除 | 替代键见设计文档 §3.4（`migViewStatus`、面板列头/三态/警示/结果文案） |
+| §3.2 `migReportManual` | 键名已取代 | `migManualNote`（设计文档 §3.4）；口径不变（§8.1） |
+| §3.2 `migBannerDesc` | 已改写 | 不再承诺「先给一份只读干跑报告」；面板即入口 |
+| §3.2 `migExecute`/`migExecuting`/`migExecPartial`/`migDone` | 已改写 | 「确认迁移」/「正在迁移…」/「部分完成…查看状态与迁移日志」/「迁移执行结束，以刷新后的逐篇状态为准」 |
+| §3.2 `migNeedsManual` | 已改写 | 中性「需人工处理，迁移会跳过」——含 quarantine，不能只说同名冲突 |
+| §3.3 整个弹层（`<pre>` 文字报告 + 逐篇 skipped/失败原因） | 已取代 | 弹层改逐篇状态面板（`data-part=paper-status-panel`）：按专题的逐篇三态（翻译/MinerU 转录/迁移）+「待迁移 N 篇 / 其中 M 篇需人工处理」+ 警示 + 一次点击。**逐篇原因不再展示**（聚合注记、日志与 agent 报告仍在） |
+| §3.3「`确认执行迁移` 默认 disabled，输入框 === `migrate` 才启用」 | 已取代 | 无输入框：加载中/失败/未知/`need.migratable=0` 时禁用并说明；`certain && migratable>0` 可点；busy 同步锁防连点 |
+| §3.3 执行结果列 `skippedPapers` | 已取代 | 只聚合成功/部分完成/失败 + 日志位置，随后强制刷新逐篇状态；部分完成保留 M 注记 |
+| §4 红线①「UI 的 confirm 只能由用户键入 `migrate` 得到」 | 已取代 | confirm 仍只来自**用户在界面上的显式操作**，但那是一次点击；服务端 `confirm:'migrate-library'` 栅栏**保留**，不称其为密码或人类身份证明 |
+| §5 P22「未输入 migrate 时执行按钮 disabled」 | 已取代（行已就地修订） | 验收改为：三轴面板 part、无输入框、加载/失败/未知/busy 禁用、可迁移时单击只发一个 POST 且 confirm 令牌保留（测试断言同步改写，见设计文档 §5.1） |
+| §7.1「不做一键迁移按钮（必须输入 migrate 确认）」 | 已修订 | 仍然**不做任何自动迁移**、不做无警示的一键执行；迁移只在面板明确警示后由用户单击一次触发 |
+| 附录 A1「执行只留在界面（需人手输入 `migrate`）」 | 已修订 | 不变：**对话侧/agent 没有任何执行路径**；变的是确认方式 = 一次点击 |
+| §8.1 弹层顶部口径注记 | 口径保留、落点与键名已取代 | N/M 同源不变；落在面板汇总行，键 `migManualNote` |
+
+**不取代（明确保留）**：`migration_report`（只读）、`migration_prompt_choice`（只写偏好）、CLI 干跑报告与
+`--apply --yes` 门、后端 `GET /api/library/migrate-plan`、以及红线②「不每次都问」/③「不阻塞旧布局」/
+④「无权限不误报」。
+
+**本轮新增的只读端点**：`GET /api/library/paper-status`（分页逐篇三态，面板打开才惰性加载，失败与分页独立）；
+它不改变上述任何执行路径，执行仍走原 `POST /api/library/migrate` 并在服务端重新权威预检。

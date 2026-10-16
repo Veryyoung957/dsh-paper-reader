@@ -6,6 +6,7 @@ import { createReadStream, existsSync, readFileSync, realpathSync } from 'node:f
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { basename, join, resolve, sep } from 'node:path'
+import { readPaperStatuses } from './library-status.ts'
 import type { PluginConfig } from './tools.ts'
 import {
   listPapers,
@@ -904,7 +905,7 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
     }
 
     // 批量清空专题（一次确认、逐篇进回收站、失败即整体回滚）：`confirmName === topic` 是**必需**的
-    // （手输专题名确认保留在清空这一步，不放松）。
+    // （UI 展示警示后单击确认，服务端仍校验 confirmName）。
     // 前置：全部校验完（存在性 / 非空 / 逐篇会话 / 逐篇翻译）才动一个字节；
     // 执行：withInflight（同一专题并发只放一个）+ library-manage.clearTopic（非递归 rmdir）。
     if (sub === '/api/library/topic/clear' && req.method === 'POST') {
@@ -947,8 +948,17 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
     }
 
     /* ── 布局迁移（旧平铺 → 按论文分文件夹）：方案 §B1.2 的只读预检 + 显式执行 + 回滚 ──
-       铁律：默认**只读**；执行必须带 confirm=migrate-library（UI/CLI 先让人核对干跑报告）；
+       铁律：默认**只读**；执行必须带 confirm=migrate-library（UI 先展示逐篇状态与警示；CLI 保留干跑报告）；
        回滚日志必须在我们的 migration-logs 目录内（不认任意路径，防被当成任意文件读写口）。 */
+    if (sub === '/api/library/paper-status' && req.method === 'GET') {
+      const offset = Number(url.searchParams.get('offset') ?? '0')
+      const limit = Number(url.searchParams.get('limit') ?? '100')
+      if (!/^\d+$/.test(url.searchParams.get('offset') ?? '0') || !/^\d+$/.test(url.searchParams.get('limit') ?? '100') || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        json(res, 400, { error: 'Invalid status pagination' }); return
+      }
+      json(res, 200, readPaperStatuses(dataDir, { offset, limit, force: url.searchParams.get('force') === '1' }))
+      return
+    }
     if (sub === '/api/library/migrate-plan' && req.method === 'GET') {
       try {
         const plan = planMigration(dataDir)
@@ -962,7 +972,7 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
     if (sub === '/api/library/migrate' && req.method === 'POST') {
       const body = (await readBody(req)) as { confirm?: string }
       if (body.confirm !== 'migrate-library') {
-        json(res, 400, { error: '需要 confirm=migrate-library 才允许执行迁移（请先 GET /api/library/migrate-plan 人工核对报告）', code: 'confirm-mismatch' })
+        json(res, 400, { error: '需要 confirm=migrate-library 才允许执行迁移（请先查看论文状态与警示）', code: 'confirm-mismatch' })
         return
       }
       await withInflight('migrate\u0000library', res, async () => {

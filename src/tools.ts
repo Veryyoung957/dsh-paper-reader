@@ -636,7 +636,7 @@ export function registerTools(ctx: Context, config: PluginConfig) {
   }))
 
   /* ── 只读干跑报告（§2.4）：用户答「要」之后给报告；**没有任何执行路径** ─────────────────────
-     执行唯一入口在界面（设置 → 论文伴读 → 查看迁移报告，需人手输入 migrate 确认）或 CLI --apply --yes。
+     执行唯一入口在界面（设置 → 论文伴读 → 查看论文状态，在逐篇状态面板里读完警示点一次「确认迁移」）或 CLI --apply --yes。
      本工具连 `runMigration` 都不 import ⇒ 「改回缺陷态」的变异（M5）必然让 P16 变红。 */
   // ⚠️ dsh-tools 的 value schema DSL 不支持 `oneOf` 成员对象上的 `required: true`
   //（`oneOf[0].required is not supported`）⇒ needSchema 本体不带 required，由外层属性声明需求。
@@ -681,7 +681,7 @@ export function registerTools(ctx: Context, config: PluginConfig) {
       '只读干跑报告：扫描文献库并列出「旧（平铺）→ 按论文分文件夹」需要收口的论文/文件、' +
       '冲突与跳过项、读不进去的子树。' +
       '**除「确保数据目录存在」外不修改任何文件，也绝不执行迁移**（干跑走的是迁移预检的同一套只读遍历）；' +
-      '执行只能在阅读器/设置面板里由用户确认（需要输入 migrate）。',
+      '执行只能在阅读器/设置面板里由用户确认（「查看论文状态」面板内警示后点一次「确认迁移」）。',
     parameters: {},
     output: {
       schema: {
@@ -749,8 +749,8 @@ export function registerTools(ctx: Context, config: PluginConfig) {
         }
         return [{
           type: 'text',
-          text: value.report + (value.truncated ? '\n（已截断，完整报告见 设置 → 论文伴读 → 查看迁移报告）' : '') +
-            '\n以上为只读报告，未改动任何文件。执行入口：设置 → 论文伴读 → 查看迁移报告（需输入 migrate 确认）；我不会自动执行。',
+          text: value.report + (value.truncated ? '\n（已截断；完整只读报告见 CLI：node dist/migrate.js --data-dir <库>，默认只跑干跑）' : '') +
+            '\n以上为只读报告，未改动任何文件。执行入口：设置 → 论文伴读 → 查看论文状态（在警示后点一次「确认迁移」）；我不会自动执行。',
         }]
       },
     },

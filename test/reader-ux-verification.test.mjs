@@ -1748,7 +1748,7 @@ test('VB12[B15/B16/S9/S10/S11] 二次确认与鉴权：清单只来自 delete-pl
   assert.ok(!/window\.(confirm|prompt)\s*\(/.test(client), '不得用 window.confirm/prompt（Electron 不支持）')
   assert.ok(!/window\.(confirm|prompt)\s*\(/.test(READER_HTML), '阅读器同样不得用原生弹窗')
   assert.match(client, /createPortal\(/, '弹窗必须走页内 portal')
-  assert.match(client, /delTopicTypeName/, '删除专题必须 type-to-confirm')
+  assert.match(client, /delTopicWarning/, '删除专题必须展示可恢复警示')
   assert.match(client, /stopPropagation/, '文献行 ⋯ 必须 stopPropagation（否则会打开会话）')
   // 「不删什么」必须在文案里（可恢复语义）
   assert.match(client, /可恢复/, '确认文案必须写明「可恢复」')

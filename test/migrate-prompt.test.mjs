@@ -653,6 +653,28 @@ test('P20 缓存：TTL 内不重复扫；面向库的写操作让缓存失效（
   }
 })
 
+test('P20b paper-status endpoint is read-only and validates pagination', async () => {
+  const ttl = process.env.DPR_MIGRATE_PROMPT_TTL_MS; process.env.DPR_MIGRATE_PROMPT_TTL_MS = '60000'
+  const lib = makeFixture('F1-flat-only')
+  const boot = await bootRoutes(lib.data)
+  try {
+    const first = await boot.get('/api/library/paper-status?offset=0&limit=1')
+    assert.equal(first.status, 200)
+    assert.equal(first.body.papers.length, 1)
+    assert.equal(first.body.nextOffset, 1)
+    assert.equal(first.body.need.papers, 3)
+    assert.equal(first.body.papers[0].migration, 'incomplete')
+    assert.equal(first.body.papers[0].translation, 'incomplete')
+    assert.equal(first.body.papers[0].mineru, 'incomplete')
+    assert.equal(existsSync(join(lib.data, '.migration-v1.done')), false)
+    const second = await boot.get('/api/library/paper-status?offset=1&limit=1')
+    assert.equal(second.body.snapshotId, first.body.snapshotId)
+    for (const query of ['offset=-1', 'offset=1.1', 'limit=0', 'limit=101', 'offset=']) {
+      assert.equal((await boot.get('/api/library/paper-status?' + query)).status, 400, query)
+    }
+  } finally { boot.srv.close(); cleanupFixture(lib); process.env.DPR_MIGRATE_PROMPT_TTL_MS = ttl ?? '0' }
+})
+
 /* ═══════════════════════════════════════════════════════════════════════════
    P21–P23 i18n / 界面元素 / 全局键
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -665,9 +687,9 @@ function dictOf(name) {
 }
 /** 新增键必须 zh/en 双份（方案 §3.2 的 18 个 + migDone，逐字冻结）。 */
 const MIG_KEYS = ['migBannerAsk', 'migBannerQuiet', 'migBannerDesc', 'migMarkerMismatch', 'migNeedsManual',
-  'migUnknown', 'migMigrated', 'migDeclinedRow', 'migViewReport', 'migLater', 'migNever', 'migRecheck',
-  'migReportTitle', 'migReportIntro', 'migConfirmHint', 'migExecute', 'migExecuting', 'migExecPartial',
-  'migReportFail', 'migDone']
+  'migUnknown', 'migMigrated', 'migDeclinedRow', 'migViewStatus', 'migLater', 'migNever', 'migRecheck',
+  'migStatusTitle', 'migPending', 'migWarning', 'migExecute', 'migExecuting', 'migExecPartial',
+  'statusFail', 'migDone']
 
 test('P21 i18n：新增键 zh/en 齐全、文案逐字冻结、中文里没有英文残留', () => {
   const zh = dictOf('zh')
@@ -677,19 +699,26 @@ test('P21 i18n：新增键 zh/en 齐全、文案逐字冻结、中文里没有�
     assert.match(en, new RegExp(`${k}: '[^']+'`), `en 缺文案：${k}`)
   }
   for (const [k, v] of [
-    ['migViewReport', '查看迁移报告'], ['migLater', '以后再说'], ['migNever', '不再提醒'], ['migRecheck', '重新检查'],
-    ['migExecute', '确认执行迁移'], ['migMigrated', '文献库已是新布局（按论文分文件夹）。'],
+    ['migViewStatus', '查看论文状态'], ['migLater', '以后再说'], ['migNever', '不再提醒'], ['migRecheck', '重新检查'],
+    ['migExecute', '确认迁移'], ['migMigrated', '文献库已是新布局（按论文分文件夹）。'],
     ['migDeclinedRow', '已选择暂不迁移（不会再主动询问）'],
   ]) assert.ok(zh.includes(`${k}: '${v}'`), `zh 文案与冻结值不一致：${k}`)
   for (const [k, v] of [
-    ['migViewReport', 'View migration report'], ['migLater', 'Not now'], ['migNever', 'Don\\\'t ask again'],
-    ['migRecheck', 'Re-check'], ['migExecute', 'Execute migration'],
+    ['migViewStatus', 'View paper status'], ['migLater', 'Not now'], ['migNever', 'Don\\\'t ask again'],
+    ['migRecheck', 'Re-check'], ['migExecute', 'Confirm migration'],
   ]) assert.ok(en.includes(`${k}: '${v}'`), `en 文案与冻结值不一致：${k}`)
-  for (const k of ['migBannerAsk', 'migBannerQuiet', 'migMarkerMismatch', 'migNeedsManual', 'migUnknown', 'migExecPartial']) {
+  for (const k of ['migBannerAsk', 'migBannerQuiet', 'migMarkerMismatch', 'migNeedsManual', 'migUnknown']) {
     assert.match(zh, new RegExp(`${k}: '[^']*\\{n\\}`), `zh 的 ${k} 必须带 {n}`)
     assert.match(en, new RegExp(`${k}: '[^']*\\{n\\}`), `en 的 ${k} 必须带 {n}`)
   }
   assert.match(zh, /migUnknown: '[^']*棵子树/, 'migUnknown 的 {n} 是**子树棵数**，不得与「还有 N 篇」混用')
+})
+
+test('P21b all status keys and placeholders agree in both languages', () => {
+  const entries = lang => new Map([...dictOf(lang).matchAll(/(\w+):\s*'((?:\\.|[^'])*)'/g)].map(m => [m[1], m[2]]))
+  const zh = entries('zh'), en = entries('en')
+  assert.deepEqual([...zh.keys()].sort(), [...en.keys()].sort())
+  for (const [key, value] of zh) assert.deepEqual((value.match(/\{\w+\}/g) || []).sort(), (en.get(key).match(/\{\w+\}/g) || []).sort(), key)
 })
 
 test('P22 界面元素：横幅/卡片/报告弹层的构件与执行门（源码级 + 纯函数级）', () => {
@@ -704,18 +733,14 @@ test('P22 界面元素：横幅/卡片/报告弹层的构件与执行门（源�
   assert.ok(bannerAt < rowsAt, '横幅要插在树行之前')
   assert.match(CLIENT_SRC, /data-dsh-part': 'migration-banner'/)
   assert.match(CLIENT_SRC, /data-dsh-part': 'migration-card'/)
-  assert.match(CLIENT_SRC, /data-dsh-part': 'migration-report'/)
+  assert.match(CLIENT_SRC, /data-dsh-part': 'paper-status-panel'/)
   assert.match(CLIENT_SRC, /'data-dpr-mig-exec'/)
-  assert.match(CLIENT_SRC, /disabled: busy \|\| !dprMigrateExecEnabled\(confirmInput\)/, '执行按钮必须默认 disabled，输入 migrate 才启用')
+  assert.match(CLIENT_SRC, /disabled: !canExecute/, '加载失败、未知或busy禁用；不需要任何文本输入')
+  assert.doesNotMatch(CLIENT_SRC, /dprMigrateExecEnabled|migConfirmHint|confirmInput/)
   assert.match(CLIENT_SRC, /confirm: 'migrate-library'/, '唯一执行入口必须带既有那道 confirm 门')
   assert.match(CLIENT_SRC, /h\(MigrationCard, null\),\s*\n\s*h\(EndpointCard, \{/, '设置卡片必须放在设置面板最前（它是状态不是配置）')
 
-  // 纯函数：执行门的逐格行为
   const pure = loadClientPure()
-  assert.equal(pure.execEnabled(''), false)
-  assert.equal(pure.execEnabled('migrate'), true)
-  assert.equal(pure.execEnabled('migrate '), false, '必须逐字（不许 trim 放宽）')
-  assert.equal(pure.execEnabled('MIGRATE'), false)
   assert.equal(pure.key, 'dpr.migratePrompt')
   // 横幅显隐矩阵（§3.5）
   assert.equal(pure.bannerMode('ask', 'idle'), 'ask')
@@ -782,6 +807,8 @@ const ASK_SNAP = {
   prompt: { level: 'ask', reason: 'unmigrated', text: '【布局提示】…还有 3 篇…' },
 }
 
+function statusStub(need) { return { ok: true, need, snapshotId: 'snapshot', scannedAt: '2026-01-01T00:00:00Z', complete: need.certain, unreadable: [], total: 1, offset: 0, nextOffset: null, papers: [{ topic: 'T1', name: 'P1', translation: 'unknown', mineru: 'complete', migration: 'incomplete' }] } }
+
 test('P25 真跑界面：横幅按状态渲染、拒绝后消失、重新检查再现；卡片状态行与执行门逐格可查', async () => {
   const store = new Map()
   // 第一帧镜像（不等网络）：服务端状态 + 上次的 need/prompt
@@ -792,14 +819,8 @@ test('P25 真跑界面：横幅按状态渲染、拒绝后消失、重新检查�
     'GET /library/migrate-prompt': () => getData,
     'DELETE /library/migrate-prompt': () => ({ ok: true, state: { choice: 'idle' }, willAsk: true }),
     'POST /library/migrate-prompt': (opts) => ({ ok: true, state: { choice: JSON.parse(opts.body).choice }, willAsk: false }),
-    'GET /library/migrate-plan': () => ({
-      ok: true,
-      plan: {
-        moves: 3, alreadyDone: 0, orphans: 0, conflicts: [], quarantine: [], unreadable: [],
-        totals: { papers: 3, files: 9, bytes: 6414, needBytes: 7697 },
-      },
-      report: '待迁移：3 篇 / 9 个文件',
-    }),
+    'GET /library/paper-status': () => statusStub(ASK_SNAP.need),
+    'POST /library/migrate': () => ({ ok: true, partial: false, logPath: '/log' }),
   }
   const ui = loadClientUi({ store, routes })
   try {
@@ -807,9 +828,9 @@ test('P25 真跑界面：横幅按状态渲染、拒绝后消失、重新检查�
     let b = ui.renderBanner()
     assert.equal(b.out.props['data-dpr-mig-mode'], 'ask')
     assert.ok(b.texts.includes('migBannerAsk'), `横幅必须显示询问文案键：${b.texts.join(' | ')}`)
-    assert.ok(b.texts.includes('migViewReport') && b.texts.includes('migLater') && b.texts.includes('migNever'))
+    assert.ok(b.texts.includes('migViewStatus') && b.texts.includes('migLater') && b.texts.includes('migNever'))
     assert.ok(b.texts.includes('migBannerDesc'))
-    assert.equal(b.byAct('report').props.children, 'migViewReport')
+    assert.equal(b.byAct('report').props.children, 'migViewStatus')
     const askedCalls = ui.calls.filter((c) => c.method === 'POST' && c.path === '/library/migrate-prompt')
     await TICKS()
     assert.ok(askedCalls.some((c) => JSON.parse(c.body).choice === 'asked'), '横幅渲染出问句后必须立刻回写 asked')
@@ -834,29 +855,136 @@ test('P25 真跑界面：横幅按状态渲染、拒绝后消失、重新检查�
     assert.ok(ui.calls.some((c) => c.method === 'DELETE' && c.path === '/library/migrate-prompt'))
     assert.equal(ui.renderBanner().out.props['data-dpr-mig-mode'], 'ask', '重新检查后横幅必须再现')
 
-    // ⑤ 报告弹层：只读预检 + 执行门（未输入 migrate 时 disabled）
-    ui.renderCard().byAct('report').props.onClick()      // 打开报告
-    ui.renderCard()                                       // 重新渲染：弹层元素出现
+    // Opening is read-only; a visible warning and one click authorize exactly one POST.
+    ui.renderCard().byAct('report').props.onClick()
+    ui.renderCard()
     const dlgNode = ui.findDialog()
-    assert.ok(dlgNode, '「查看迁移报告」必须渲染出弹层')
-    ui.renderDialog(dlgNode)                              // 触发只读预检
+    assert.ok(dlgNode)
+    ui.renderDialog(dlgNode)
     await TICKS()
     const d = ui.renderDialog(dlgNode)
-    assert.ok(d.texts.includes('migReportTitle'))
-    assert.ok(d.texts.includes('migConfirmHint'))
-    assert.ok(ui.calls.some((c) => c.path === '/library/migrate-plan'), '弹层必须走既有只读预检路由')
-    assert.equal(d.exec.props.disabled, true, '未输入 migrate 时执行按钮必须 disabled')
-    d.confirm.props.onChange({ target: { value: 'migrate' } })
-    const d2 = ui.renderDialog(dlgNode)
-    assert.equal(d2.exec.props.disabled, false, '输入 migrate 后才可以点')
-    d2.confirm.props.onChange({ target: { value: 'migrate2' } })
-    assert.equal(ui.renderDialog(dlgNode).exec.props.disabled, true, '输错就不许点')
-    assert.ok(d2.intro, '报告顶部必须有要点行（migReportIntro）')
-    assert.match(d2.texts.join(' | '), /待迁移：3 篇 \/ 9 个文件/, '弹层必须显示只读预检拿到的原文报告')
-    assert.match(d2.texts.join(' | '), /migConfirmHint/)
+    assert.ok(d.texts.includes('migStatusTitle'))
+    assert.ok(d.texts.includes('migWarning'))
+    assert.equal(d.confirm, null)
+    assert.ok(ui.calls.some(c => c.path === '/library/paper-status'))
+    assert.equal(ui.calls.filter(c => c.path === '/library/migrate').length, 0, 'open must never execute')
+    assert.equal(d.exec.props.disabled, false)
+    assert.ok(d.intro)
+    assert.equal(findNode(d.out, n => n.type === 'pre'), null)
+    assert.ok(findNode(d.out, n => n.props?.['data-dpr-status-axis'] === 'translation'))
+    assert.ok(findNode(d.out, n => n.props?.['data-dpr-status-axis'] === 'mineru'))
+    assert.ok(findNode(d.out, n => n.props?.['data-dpr-status-axis'] === 'migration'))
+    const first = d.exec.props.onClick()
+    const second = d.exec.props.onClick()
+    await Promise.all([first, second])
+    const executed = ui.calls.filter(c => c.path === '/library/migrate')
+    assert.equal(executed.length, 1, 'busy synchronous lock rejects double click')
+    assert.deepEqual(JSON.parse(executed[0].body), { confirm: 'migrate-library' })
   } finally {
     ui.dispose()
     try { rmSync(HOME, { recursive: true, force: true }) } catch { /* 无所谓 */ }
+  }
+})
+
+test('P25c panel refresh atomically replaces old ask with migrated/unknown authority without asked writes', async () => {
+  for (const initial of ['ask', 'silent']) for (const state of ['migrated', 'unknown', 'unmigrated']) for (const choice of ['idle', 'asked', 'later', 'declined']) {
+    let need = ASK_SNAP.need
+    let phase = 'old'
+    const preference = { choice, dataDir: need.dataDirId, fingerprint: need.fingerprint }
+    const routes = {
+      'GET /library/migrate-prompt': () => ({ need, state: preference, prompt: phase === 'old' ? { level: initial } : { level: state === 'migrated' ? 'silent' : state === 'unknown' ? 'info' : choice === 'idle' ? 'ask' : 'info' } }),
+      'GET /library/paper-status': () => statusStub(need),
+      'POST /library/migrate-prompt': opts => ({ state: { ...preference, choice: JSON.parse(opts.body).choice } }),
+    }
+    const ui = loadClientUi({ store: new Map([['dpr.mode', 'paper']]), routes })
+    try {
+      ui.renderCard(); await TICKS()
+      ui.renderCard().byAct('report').props.onClick(); ui.renderCard()
+      const node = ui.findDialog()
+      phase = 'fresh'
+      need = { ...ASK_SNAP.need, state, papers: state === 'migrated' ? 0 : 3, migratable: state === 'unmigrated' ? 3 : 0, certain: state !== 'unknown', fingerprint: 'new-' + state, unreadable: state === 'unknown' ? [{ dir: 'A', cause: 'EACCES' }] : [] }
+      const before = ui.calls.filter(c => c.method === 'POST').length
+      ui.renderDialog(node); await TICKS()
+      const banner = ui.renderBanner()
+      ui.renderCard(); await TICKS()
+      const delta = ui.calls.filter(c => c.method === 'POST').slice(before)
+      if (state !== 'unmigrated' || choice !== 'idle') {
+        assert.ok(!banner || banner.out.props['data-dpr-mig-mode'] !== 'ask', state + '/' + choice)
+        assert.ok(!banner?.texts.includes('migBannerAsk'), state + '/' + choice + ' must not render old ask')
+        assert.equal(delta.length, 0, state + '/' + choice + ' must not write preferences')
+      } else assert.equal(delta.filter(c => JSON.parse(c.body).choice === 'asked').length, 1)
+      const dialog = ui.renderDialog(node)
+      if (state === 'migrated') assert.ok(dialog.texts.includes('migNothingToExecute'))
+      if (state === 'unknown') assert.ok(dialog.texts.includes('migNotExecutable'))
+    } finally { ui.dispose() }
+  }
+})
+
+test('P25d delayed older status response cannot overwrite a newer refresh', async () => {
+  let resolveOld
+  let count = 0
+  const fresh = { ...ASK_SNAP.need, state: 'migrated', papers: 0, migratable: 0, fingerprint: 'done' }
+  const srv = makeMigServer(fresh)
+  srv.routes['GET /library/migrate-prompt'] = () => ({ need: fresh, state: { choice: 'idle' }, prompt: { level: 'silent' } })
+  srv.routes['GET /library/paper-status'] = () => ++count === 1 ? new Promise(resolve => { resolveOld = resolve }) : statusStub(fresh)
+  const ui = loadClientUi({ store: new Map([['dpr.mode', 'paper']]), routes: srv.routes })
+  try {
+    ui.renderCard(); await TICKS(); ui.renderCard().byAct('report').props.onClick(); ui.renderCard()
+    const node = ui.findDialog(); ui.renderDialog(node); await TICKS()
+    const newer = ui.renderDialog(node)
+    const refresh = findNode(newer.out, n => n.type === 'button' && n.props.children === 'statusRefresh')
+    await refresh.props.onClick()
+    resolveOld(statusStub(ASK_SNAP.need)); await TICKS()
+    assert.equal(ui.renderBanner(), null)
+    assert.ok(ui.renderDialog(node).texts.includes('migNothingToExecute'))
+    assert.equal(ui.calls.filter(c => c.method === 'POST').length, 0)
+  } finally { ui.dispose() }
+})
+
+test('P25e status panel renders a structured four-column grouped table', async () => {
+  const srv = makeMigServer(ASK_SNAP.need)
+  srv.routes['GET /library/paper-status'] = () => ({ ...statusStub(ASK_SNAP.need), papers: [{ topic: 'T', name: 'A', translation: 'complete', mineru: 'unknown', migration: 'incomplete' }, { topic: 'T', name: 'B', translation: 'unknown', mineru: 'complete', migration: 'complete' }] })
+  const ui = loadClientUi({ store: new Map([['dpr.mode', 'paper']]), routes: srv.routes })
+  try {
+    ui.renderCard().byAct('report').props.onClick(); ui.renderCard(); const node = ui.findDialog(); ui.renderDialog(node); await TICKS(); const rendered = ui.renderDialog(node)
+    const table = findNode(rendered.out, n => n.props?.['data-dpr-status-table'] === '')
+    assert.ok(table); assert.equal(table.props.role, 'table')
+    assert.match(CLIENT_SRC, /statusPaper/); assert.match(CLIENT_SRC, /statusTranslation/); assert.match(CLIENT_SRC, /statusMineru/); assert.match(CLIENT_SRC, /statusMigration/)
+    assert.match(CLIENT_SRC, /statusExpand/); assert.match(CLIENT_SRC, /statusCollapse/); assert.match(CLIENT_SRC, /max-width: 420px/)
+    assert.ok(findNode(rendered.out, n => n.props?.['data-dpr-topic-group'] === 'T'))
+    for (const [axis, label] of [['translation', 'statusTranslation'], ['mineru', 'statusMineru'], ['migration', 'statusMigration']]) {
+      const tag = findNode(rendered.out, n => n.props?.['data-dpr-status-axis-label'] === axis)
+      assert.ok(tag, axis + ' must render its own visible narrow-screen axis label')
+      assert.equal(tag.props.children, label + ': ')
+    }
+    assert.match(CLIENT_SRC, /@media \(max-width: 420px\) \{ \[data-dpr-status-axis-label\] \{ display:inline; \}/)
+    assert.match(CLIENT_SRC, /overflow-x:hidden !important/)
+  } finally { ui.dispose() }
+})
+
+test('P25f loading more snapshot change clears old visible data before reload', () => {
+  const atSnapshot = CLIENT_SRC.indexOf("latest.current?.snapshotId !== d.snapshotId")
+  const clear = CLIENT_SRC.indexOf('setData(null)', atSnapshot)
+  const restart = CLIENT_SRC.indexOf('return await load(0, false)', atSnapshot)
+  assert.ok(atSnapshot >= 0, '加载更多必须检测snapshot变化')
+  assert.ok(clear > atSnapshot && clear < restart, 'snapshot变化立即清空旧data')
+  assert.ok(restart > clear, '清空后才重载第一页')
+})
+test('P25b unknown, failed and zero-migratable status never authorize execution', async () => {
+  for (const mode of ['unknown', 'failed', 'empty']) {
+    const need = { ...ASK_SNAP.need, certain: mode !== 'unknown', migratable: mode === 'empty' ? 0 : 3 }
+    const routes = makeMigServer(need).routes
+    routes['GET /library/paper-status'] = () => { if (mode === 'failed') throw new Error('unreadable'); return statusStub(need) }
+    const ui = loadClientUi({ store: new Map([['dpr.mode', 'paper']]), routes })
+    try {
+      ui.renderCard().byAct('report').props.onClick(); ui.renderCard()
+      const node = ui.findDialog(); ui.renderDialog(node); await TICKS()
+      const result = ui.renderDialog(node)
+      assert.equal(result.exec.props.disabled, true, mode)
+      await result.exec.props.onClick()
+      assert.equal(ui.calls.filter(c => c.path === '/library/migrate').length, 0, mode)
+      assert.ok(result.texts.includes('migWarning'))
+    } finally { ui.dispose() }
   }
 })
 
@@ -883,7 +1011,7 @@ function makeMigServer(need = ASK_SNAP.need) {
       return { ok: true, state: { ...st }, willAsk: b.choice === 'idle' }
     },
     'DELETE /library/migrate-prompt': () => { calls.del++; st.choice = 'idle'; return { ok: true, state: { ...st }, willAsk: true } },
-    'GET /library/migrate-plan': () => ({ ok: true, plan: PLAN_STUB, report: '待迁移：3 篇 / 9 个文件' }),
+    'GET /library/paper-status': () => statusStub(need),
   }
   return { st, calls, routes, promptOf }
 }
@@ -986,19 +1114,11 @@ test('P28 裁定(alt) 竞态：declined 与 asked 交错后最终仍是 declined
 })
 
 test('P29 裁定(a) 弹层口径：篇数用判据 need（与横幅同源），并注明「其中 N 篇需人工处理」', async () => {
-  const pure = loadClientPure()
-  const zhIntro = /migReportIntro: '([^']+)'/.exec(dictOf('zh'))[1]
-  const tReal = (k) => (k === 'migReportIntro' ? zhIntro : k)
-  // 权威报告 totals.papers=0（少算），判据说还有 3 篇 ⇒ 弹层必须显示 3（一个屏上不许两个数字）
-  const text = pure.reportIntro(PLAN_STUB, { papers: 3, files: 9 }, tReal)
-  assert.match(text, /待迁移 3 篇 \/ 9 个文件/, `必须用 need 口径：${text}`)
-  assert.match(text, /冲突 1 个/)
-  assert.ok(!/待迁移 0 篇/.test(text), '绝不许再出现 plan.totals 的少算数字')
-  // 换了口径要写在纸面上：有 conflict ⇒ 顶部必须给「其中 N 篇需人工处理」
+  // plan.totals.papers may be zero; panel must use need from the shared status scan.
   const store = new Map()
   store.set('dpr.mode', 'paper')
-  const srv = makeMigServer()
-  const ui = loadClientUi({ store, routes: srv.routes })
+  const srv = makeMigServer({ ...ASK_SNAP.need, byClass: { flat: 1, residue: 0, conflict: 1, quarantine: 1 } })
+  const ui = loadClientUi({ store, routes: srv.routes, translate: k => k === 'migPending' || k === 'migBannerAsk' ? 'pending {n}' : k === 'migManualNote' ? 'manual {n}' : k })
   try {
     ui.renderCard().byAct('report').props.onClick()
     ui.renderCard()
@@ -1007,7 +1127,10 @@ test('P29 裁定(a) 弹层口径：篇数用判据 need（与横幅同源），�
     ui.renderDialog(dlg)
     await TICKS()
     const d = ui.renderDialog(dlg)
-    assert.ok(d.texts.includes('migReportManual'), `顶部必须注明口径：${d.texts.join(' | ')}`)
+    assert.equal(d.intro.props.children, 'pending 3')
+    assert.ok(ui.renderBanner().texts.includes('pending 3'))
+    assert.match(CLIENT_SRC, /t\('migPending'\)\.replace\('\{n\}', String\(need\.papers\)\)/)
+    assert.ok(d.texts.includes('manual 2'), `顶部必须注明口径：${d.texts.join(' | ')}`)
   } finally {
     ui.dispose()
     try { rmSync(HOME, { recursive: true, force: true }) } catch { /* 无所谓 */ }
@@ -1158,7 +1281,7 @@ function migAskedHarness() {
   const body = extractFnText(CLIENT_SRC, 'function migMarkAsked(')
   const calls = []
   const api = (path, opts) => { calls.push(JSON.parse(opts.body)); return Promise.resolve({ state: { choice: 'asked' } }) }
-  const mark = new Function('api', 'migMirrorWrite', `let migAskedFp = null;\n${body}\n;return migMarkAsked;`)(api, () => {})
+  const mark = new Function('api', 'migMirrorWrite', `const migStore = { snap: null }; let migAskedFp = null;\n${body}\n;return migMarkAsked;`)(api, () => {})
   return { calls, mark }
 }
 const snapOf = (level, choice, { fp = 'f'.repeat(12), dir = '/lib/A', papers = 2, state = 'unmigrated' } = {}) => ({
@@ -1198,7 +1321,7 @@ test('P34 裁定(a)/R1 记账由服务端门推导：同库指纹变化、换库
         srv.state = { choice: 'asked', dataDir: posts[posts.length - 1].dataDir, fingerprint: posts[posts.length - 1].fingerprint }
         return { ok: true, state: srv.state, willAsk: false }
       },
-      'GET /library/migrate-plan': () => ({ ok: true, plan: PLAN_STUB, report: '' }),
+      'GET /library/paper-status': () => statusStub(ASK_SNAP.need),
     },
   })
   try {
@@ -1270,7 +1393,7 @@ test('P35 裁定(d)/R3 同库弱回答不许降级（服务端含 later；界面
       store,
       routes: {
         'GET /library/migrate-prompt': () => ({ ok: true, need: snap.need, prompt: { level: 'info', reason: 'declined', text: '' }, state: snap.state }),
-        'GET /library/migrate-plan': () => ({ ok: true, plan: PLAN_STUB, report: '' }),
+        'GET /library/paper-status': () => statusStub(ASK_SNAP.need),
         'POST /library/migrate-prompt': () => ({ ok: true, state: snap.state, willAsk: false }),
       },
     })
@@ -1291,7 +1414,7 @@ test('P35 裁定(d)/R3 同库弱回答不许降级（服务端含 later；界面
       const d = ui.renderDialog(dlg)
       assert.equal(findNode(d.exec ? d.exec : null, (n) => n.props && n.props['data-dpr-mig'] === 'later'), null)
       assert.equal(d.texts.includes('migLater'), false, '弹层：declined 时不渲染弱回答按钮')
-      assert.equal(d.texts.includes('migReportTitle'), true, '弹层其余内容照常')
+      assert.equal(d.texts.includes('migStatusTitle'), true, '弹层其余内容照常')
       // 横幅：declined 时整个不渲染（更不会露出弱回答按钮）
       assert.equal(ui.renderBanner(), null, '横幅：declined 时不渲染')
     } finally {
@@ -1391,7 +1514,7 @@ function makeFakeReact() {
       const children = kids.length === 0 ? undefined : kids.length === 1 ? kids[0] : kids
       return { type, props: { ...(props || {}), children } }
     },
-    useRef(init) { return { current: init } },
+    useRef(init) { return React.useState(() => ({ current: init }))[0] },
     useState(init) {
       const k = `${current}#${cursor++}`
       if (!cells.has(k)) cells.set(k, typeof init === 'function' ? init() : init)
@@ -1442,7 +1565,7 @@ function loadClientPure() {
   const ctx = { window: { __ModuleLoader__: { load: (m) => { loaded = m } } }, console }
   vm.createContext(ctx)
   vm.runInContext(readFileSync(join(REPO, 'lib', 'client.js'), 'utf8')
-    + '\n;globalThis.__dprMigPure = { key: DPR_MIGRATE_PROMPT_KEY, bannerMode: dprMigrateBannerMode, statusKey: dprMigrateStatusKey, execEnabled: dprMigrateExecEnabled, mirrorPrompt: dprMigrateMirrorPrompt, reportIntro: dprMigrateReportIntro };', ctx, { filename: 'client-mig-pure.js' })
+    + '\n;globalThis.__dprMigPure = { key: DPR_MIGRATE_PROMPT_KEY, bannerMode: dprMigrateBannerMode, statusKey: dprMigrateStatusKey, mirrorPrompt: dprMigrateMirrorPrompt };', ctx, { filename: 'client-mig-pure.js' })
   assert.ok(loaded && typeof loaded.factory === 'function', 'client.js 必须通过 __ModuleLoader__.load 注册模块')
   PURE = ctx.__dprMigPure
   return PURE
@@ -1474,14 +1597,14 @@ function loadMigrateLsKeys(store) {
 }
 
 /** 真跑 `apply()`，拿到注册进 settings.section / sidebar.workspaces 的真组件，再用伪 React 渲染。 */
-function loadClientUi({ store = new Map(), routes = {} } = {}) {
+function loadClientUi({ store = new Map(), routes = {}, translate = k => k } = {}) {
   const { React, begin } = makeFakeReact()
   let loaded = null
   const calls = []
   const fetchStub = async (url, opts) => {
     const path = String(url).replace('/paper-reader/api', '')
     const method = (opts && opts.method) || 'GET'
-    calls.push({ path: path.split('?')[0], method, body: opts && opts.body })
+    calls.push({ path: path.split('?')[0], query: path.split('?')[1], method, body: opts && opts.body })
     const key = `${method} ${path.split('?')[0]}`
     const h = routes[key]
     assert.ok(h, `未 stub 的路由：${key}`)
@@ -1520,7 +1643,7 @@ function loadClientUi({ store = new Map(), routes = {} } = {}) {
   const mod = loaded.factory((name) => (name === 'react' ? React : { createPortal: (node) => node }))
   mod.apply({
     effect: (fn) => { fn(); return () => {} },
-    locale: { register: () => {}, bind: () => (k) => k },
+    locale: { register: () => {}, bind: () => translate },
     layout: {}, uiWorkspace: {}, sidebarRight: {}, sidebarRightTabs: { register: () => {} },
     theme: {},
     slots: { inject: (name, fn) => { fn() }, register: (def, comp) => { registered.push({ def, comp }); return () => {} } },
@@ -1561,13 +1684,13 @@ function loadClientUi({ store = new Map(), routes = {} } = {}) {
       return r
     },
     findDialog() {
-      const pred = (n) => typeof n.type === 'function' && n.type.name === 'MigrationReportDialog'
+      const pred = (n) => typeof n.type === 'function' && n.type.name === 'PaperStatusDialog'
       return findNode(last.card ?? null, pred) ?? findNode(last.banner ?? null, pred) ?? null
     },
     renderDialog(node) {
-      const r = render('MigrationReportDialog', node, true)
+      const r = render('PaperStatusDialog', node, true)
       return {
-        texts: r.texts,
+        out: r.out, texts: r.texts,
         exec: findNode(r.out, (n) => n.props && 'data-dpr-mig-exec' in n.props),
         confirm: findNode(r.out, (n) => n.props && 'data-dpr-mig-confirm' in n.props),
         intro: findNode(r.out, (n) => n.props && 'data-dpr-mig-intro' in n.props),

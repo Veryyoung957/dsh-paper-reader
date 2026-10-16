@@ -18,11 +18,11 @@
 // `GET /api/library/migrate-plan`（planMigration，含 sha256）才是权威。探针实测两者在 12 个夹具上
 // 分类与 stale 集合**零差异**（.probe/migrate-prompt/，方案 §0.3）；文案只给篇数、不展开 residue/conflict 细节。
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { dirname, join, resolve } from 'node:path'
-import { dshHome, isPaperDir, isPaperPDF } from './library.ts'
-import { matchArtifactName } from './library-manage.ts'
+import { dshHome, isPaperPDF } from './library.ts'
+import { PAPER_STEM_SUFFIXES, PDF2ZH_VARIANT_SUFFIXES } from './library-manage.ts'
 import { DONE_MARKER, PARTIAL_MARKER, paperDirNameProblem } from './migrate.ts'
 
 /** 论文还有平铺产物的四种形态（方案 §1.1 第 5 条）。 */
@@ -76,10 +76,10 @@ const CLASSES: MigrationClass[] = ['flat', 'residue', 'conflict', 'quarantine']
    ① 判据：实际扫目录
    ═══════════════════════════════════════════════════════════════════════════ */
 
-interface FlatHit { dir: string; stem: string; files: string[]; cls: MigrationClass }
+export interface FlatHit { dir: string; stem: string; files: string[]; cls: MigrationClass }
 
 function sizeOf(file: string): number {
-  try { return statSync(file).size } catch { return -1 }
+  try { const st = lstatSync(file); return st.isFile() && !st.isSymbolicLink() ? st.size : -2 } catch (e) { return (e as NodeJS.ErrnoException).code === 'ENOENT' ? -1 : -2 }
 }
 
 function emptyNeed(root: string, state: MigrationState): MigrationNeed {
@@ -119,7 +119,11 @@ function fingerprintOf(hits: FlatHit[], unreadableCount: number): string {
  * 递归扫描（论文目录**不递归**，与 planMigration 同口径）：命中论文目录即登记 stem 并停止下潜，
  * 否则继续（跳过 `.` 开头的非论文目录，同 listPapers）。readdir 抛错 ⇒ 记 unreadable 并**继续**其它子树。
  */
+export interface MigrationScanPaper { topic: string; name: string; folder: boolean }
+const scanDetails = new WeakMap<MigrationNeed, { papers: MigrationScanPaper[]; hits: FlatHit[] }>()
+export function migrationScanDetails(need: MigrationNeed) { return scanDetails.get(need) ?? { papers: [], hits: [] } }
 function scanOnce(root: string): MigrationNeed {
+  const discovered: MigrationScanPaper[] = []
   const hits: FlatHit[] = []
   const unreadable: Array<{ dir: string; cause: string }> = []
   let orphans = 0
@@ -153,22 +157,31 @@ function scanOnce(root: string): MigrationNeed {
       taken.add(e.name)
       if (e.isDirectory()) {
         const child = join(dir, e.name)
-        if (isPaperDir(child)) { paperDirs++; folderStems.add(e.name); continue }
+        let paper = false
+        try { const pdf = lstatSync(join(child, e.name + '.pdf')); paper = pdf.isFile() && !pdf.isSymbolicLink(); if (pdf.isSymbolicLink()) unreadable.push({ dir: rel ? `${rel}/${e.name}` : e.name, cause: 'symlink' }) }
+        catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') unreadable.push({ dir: rel ? `${rel}/${e.name}` : e.name, cause: (err as NodeJS.ErrnoException).code ?? 'unknown' }) }
+        if (paper) { paperDirs++; folderStems.add(e.name); continue }
         if (e.name.startsWith('.')) continue
         subdirs.push(e.name)
         continue
       }
-      if (isPaperPDF(e.name)) flatStems.add(e.name.slice(0, -4))
+      if (e.isSymbolicLink()) { unreadable.push({ dir: rel || '.', cause: 'symlink' }); continue }
+      if (e.isFile() && isPaperPDF(e.name)) flatStems.add(e.name.slice(0, -4))
     }
 
     // 第二步：把本层的**非目录**条目挂到命中的 stem 上（精确后缀族匹配，刻意不用 startsWith）
     const byStem = new Map<string, string[]>()
-    for (const stem of [...folderStems, ...flatStems]) byStem.set(stem, [])
+    for (const stem of new Set([...folderStems, ...flatStems])) { byStem.set(stem, []); discovered.push({ topic: rel, name: stem, folder: folderStems.has(stem) }) }
     for (const e of entries) {
       if (e.isDirectory()) continue
+      const base = e.name.replace(/\.tmp-\d+-[0-9a-f]{8}$/, '')
+      const suffixes = [...PAPER_STEM_SUFFIXES, ...PDF2ZH_VARIANT_SUFFIXES.map(v => v + '.pdf')]
       let matched = false
-      for (const stem of byStem.keys()) {
-        if (matchArtifactName(stem, e.name)) { byStem.get(stem)!.push(e.name); matched = true; break }
+      for (const suffix of suffixes) {
+        if (!base.endsWith(suffix)) continue
+        const stem = base.slice(0, -suffix.length)
+        const files = byStem.get(stem)
+        if (files) { files.push(e.name); matched = true; break }
       }
       if (matched) continue
       // 没匹配上任何论文 stem 的隐藏名（.DS_Store 等）不算孤儿；其余原地不动、只报告
@@ -185,7 +198,7 @@ function scanOnce(root: string): MigrationNeed {
       } else if (folderStems.has(stem)) {
         // 文件夹赢了：逐个比同名文件的 size（不 hash）。缺失或不同 ⇒ conflict（迁移会跳过该篇，绝不覆盖）
         const folderDir = join(dir, stem)
-        cls = files.every((f) => sizeOf(join(folderDir, f)) === sizeOf(join(dir, f))) ? 'residue' : 'conflict'
+        cls = files.every((f) => { const source = sizeOf(join(dir, f)); const target = sizeOf(join(folderDir, f)); if (source < 0 || target === -2) unreadable.push({ dir: rel || '.', cause: 'stat-failed' }); return source >= 0 && target >= 0 && target === source }) ? 'residue' : 'conflict'
       } else if (taken.has(stem)) {
         // 同名条目存在但**不是**论文文件夹（被普通文件或子专题目录占据）⇒ planMigration 会报 conflict
         cls = 'conflict'
@@ -198,6 +211,8 @@ function scanOnce(root: string): MigrationNeed {
     for (const name of subdirs) walk(rel ? `${rel}/${name}` : name)
   }
   walk('')
+  const seenUnreadable = new Set<string>()
+  for (let i = 0; i < unreadable.length;) { const dir = unreadable[i]!.dir; if (seenUnreadable.has(dir)) unreadable.splice(i, 1); else { seenUnreadable.add(dir); i++ } }
 
   const byClass: Record<MigrationClass, number> = { flat: 0, residue: 0, conflict: 0, quarantine: 0 }
   let files = 0
@@ -224,7 +239,7 @@ function scanOnce(root: string): MigrationNeed {
   // 一篇论文都没有的库下布局结论 = 误报）。现在 papers===0 且 paperDirs===0 ⇒ 'empty'，标记只进
   // markerSync（如实表达分歧），不再单独构成「已迁移」的证据。
 
-  return {
+  const need: MigrationNeed = {
     dataDir: root,
     dataDirId: dataDirIdOf(root),
     scannedAt: new Date().toISOString(),
@@ -241,6 +256,8 @@ function scanOnce(root: string): MigrationNeed {
     markerSync,
     fingerprint: fingerprintOf(hits, unreadable.length),
   }
+  scanDetails.set(need, { papers: discovered, hits })
+  return need
 }
 
 /* ── 进程内缓存（方案 §1.4）：TTL + 显式失效 + 扫描计数（用例据此断言「第二次不再扫」） ── */
@@ -274,7 +291,8 @@ export function detectMigrationNeed(dataDir: string, opts: { force?: boolean; ha
   let need: MigrationNeed
   try {
     // 不存在 ⇒ empty 并立即返回（**绝不** mkdir：红线④）
-    need = existsSync(root) ? scanOnce(root) : emptyNeed(root, 'empty')
+    try { const st = lstatSync(root); need = st.isDirectory() && !st.isSymbolicLink() ? scanOnce(root) : emptyNeed(root, 'unknown') }
+    catch (err) { if ((err as NodeJS.ErrnoException).code === 'ENOENT') need = emptyNeed(root, 'empty'); else throw err }
   } catch {
     const fallback = emptyNeed(root, 'unknown')
     need = { ...fallback, certain: false, unreadable: [{ dir: '.', cause: 'scan-failed' }] }
