@@ -216,7 +216,10 @@ test('P0 判据与权威报告（planMigration + listPapers）在 12 个夹具�
       rmSync(lib.root, { recursive: true, force: true })
     }
   }
-  assert.equal(rows.length, 12, '12 个夹具都要跑到（少一个就是空转）')
+  // 防「空转」：每个**应跑**的夹具都必须跑到。win32 跳过 F7-unreadable（见循环内说明），
+  // 所以期望数随平台变化，而不是放宽成「至少跑几个」。
+  const wantRows = process.platform === 'win32' ? 11 : 12
+  assert.equal(rows.length, wantRows, `${wantRows} 个夹具都要跑到（少一个就是空转；win32 跳过 F7-unreadable）`)
 })
 
 /* ═══════════════════════════════════════════════════════════════════════════
