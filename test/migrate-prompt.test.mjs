@@ -173,6 +173,10 @@ function makeTools(dataDir) {
 test('P0 判据与权威报告（planMigration + listPapers）在 12 个夹具上零差异，且指纹与 t1 探针逐字一致', () => {
   const rows = []
   for (const [name, spec] of Object.entries(FIXTURES)) {
+    // Windows 上 `chmodSync(dir, 0o000)` 只是给目录设「只读」属性，目录照样能列 ⇒
+    // F7-unreadable 赖以成立的**平台前提不成立**（会把「不可读」测成「可读」，进而误判产品缺陷）。
+    // 该行为由 POSIX（ubuntu/macOS）覆盖；win32 只跳过这一个夹具，其余 11 个照跑。
+    if (name === 'F7-unreadable' && process.platform === 'win32') continue
     const lib = newLib()
     try {
       spec.build(lib.data)
@@ -408,7 +412,11 @@ test('P11 quarantine（名 >100 字符）：papers 取自扫描而不是 plan.to
   } finally { cleanupFixture(lib) }
 })
 
-test('P12 子树不可读：info、文本不含篇数、偏好文件未写', async () => {
+test('P12 子树不可读：info、文本不含篇数、偏好文件未写', {
+  // 依赖 F7-unreadable：Windows 上 chmod 0o000 只等于「只读属性」，目录仍可列，
+  // 夹具造不出「读不进去」⇒ 平台前提不成立。同一条行为由 POSIX 覆盖（见 P0 同一夹具的说明）。
+  skip: process.platform === 'win32' ? 'win32 无法用 chmod 造不可读子树（0o000 只是只读属性），行为由 ubuntu/macOS 覆盖' : false,
+}, async () => {
   const lib = makeFixture('F7-unreadable')
   try {
     const out = await makeTools(lib.data).list_papers.execute({}, {})
