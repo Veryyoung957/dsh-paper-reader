@@ -6,6 +6,7 @@ import { createReadStream, existsSync, readFileSync, realpathSync } from 'node:f
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { basename, join, resolve, sep } from 'node:path'
+import { readPaperStatuses } from './library-status.ts'
 import type { PluginConfig } from './tools.ts'
 import {
   listPapers,
@@ -95,6 +96,15 @@ import {
   rollbackMigration,
   runMigration,
 } from './migrate.ts'
+import {
+  decideMigrationPrompt,
+  detectMigrationNeed,
+  invalidateMigrationPromptCache,
+  promptStatePayload,
+  readPromptState,
+  resetPromptState,
+  writePromptState,
+} from './migrate-prompt.ts'
 import { noteOrigin } from './origin.ts'
 import {
   clearThemeConfig,
@@ -488,6 +498,11 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
 
   const dispatch = async (req: Req, res: Res, url: URL) => {
     const sub = url.pathname.slice('/paper-reader'.length) // '' | '/' | '/api/...'
+
+    /* 未迁移提示的判据缓存失效（方案 §1.4）：**任何面向文献库的写操作**都可能改变布局
+       （上传/删除/改名/新建专题/清空/迁移/回滚）⇒ 下一次读取重新扫描。
+       放在分派入口一处，避免 8 个写路由各漏一处；最坏代价只是一次几十毫秒的重复扫描。 */
+    if (req.method !== 'GET' && sub.startsWith('/api/library')) invalidateMigrationPromptCache(dataDir)
 
     if ((sub === '' || sub === '/') && req.method === 'GET') {
       // no-cache：桌面端 webview 无法强刷（README 里浏览器 Cmd+Shift+R 的建议对桌面端
@@ -890,7 +905,7 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
     }
 
     // 批量清空专题（一次确认、逐篇进回收站、失败即整体回滚）：`confirmName === topic` 是**必需**的
-    // （手输专题名确认保留在清空这一步，不放松）。
+    // （UI 展示警示后单击确认，服务端仍校验 confirmName）。
     // 前置：全部校验完（存在性 / 非空 / 逐篇会话 / 逐篇翻译）才动一个字节；
     // 执行：withInflight（同一专题并发只放一个）+ library-manage.clearTopic（非递归 rmdir）。
     if (sub === '/api/library/topic/clear' && req.method === 'POST') {
@@ -933,8 +948,17 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
     }
 
     /* ── 布局迁移（旧平铺 → 按论文分文件夹）：方案 §B1.2 的只读预检 + 显式执行 + 回滚 ──
-       铁律：默认**只读**；执行必须带 confirm=migrate-library（UI/CLI 先让人核对干跑报告）；
+       铁律：默认**只读**；执行必须带 confirm=migrate-library（UI 先展示逐篇状态与警示；CLI 保留干跑报告）；
        回滚日志必须在我们的 migration-logs 目录内（不认任意路径，防被当成任意文件读写口）。 */
+    if (sub === '/api/library/paper-status' && req.method === 'GET') {
+      const offset = Number(url.searchParams.get('offset') ?? '0')
+      const limit = Number(url.searchParams.get('limit') ?? '100')
+      if (!/^\d+$/.test(url.searchParams.get('offset') ?? '0') || !/^\d+$/.test(url.searchParams.get('limit') ?? '100') || !Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        json(res, 400, { error: 'Invalid status pagination' }); return
+      }
+      json(res, 200, readPaperStatuses(dataDir, { offset, limit, force: url.searchParams.get('force') === '1' }))
+      return
+    }
     if (sub === '/api/library/migrate-plan' && req.method === 'GET') {
       try {
         const plan = planMigration(dataDir)
@@ -948,7 +972,7 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
     if (sub === '/api/library/migrate' && req.method === 'POST') {
       const body = (await readBody(req)) as { confirm?: string }
       if (body.confirm !== 'migrate-library') {
-        json(res, 400, { error: '需要 confirm=migrate-library 才允许执行迁移（请先 GET /api/library/migrate-plan 人工核对报告）', code: 'confirm-mismatch' })
+        json(res, 400, { error: '需要 confirm=migrate-library 才允许执行迁移（请先查看论文状态与警示）', code: 'confirm-mismatch' })
         return
       }
       await withInflight('migrate\u0000library', res, async () => {
@@ -994,6 +1018,82 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
           if (!libFail(res, err)) throw err
         }
       })
+      return
+    }
+
+    /* ── 「未迁移提示」的只读状态与偏好（冻结方案 §3.5）─────────────────────────
+       GET  ?force=1 = 重新检查（绕过 60s 缓存）；POST 只写偏好（**绝不迁移任何文件**）；DELETE 重置为 idle。
+       判据**实际扫目录**（detectMigrationNeed），标记与磁盘不一致时如实表达（need.markerSync）。 */
+    if (sub === '/api/library/migrate-prompt' && req.method === 'GET') {
+      const force = url.searchParams.get('force') === '1'
+      const need = detectMigrationNeed(dataDir, { force })
+      const state = readPromptState()
+      const prompt = decideMigrationPrompt(need, state)
+      json(res, 200, {
+        ok: true,
+        need,
+        prompt: { level: prompt.level, reason: prompt.reason, text: prompt.text },
+        state: promptStatePayload(state),
+      })
+      return
+    }
+
+    if (sub === '/api/library/migrate-prompt' && req.method === 'POST') {
+      const body = (await readBody(req)) as { choice?: unknown; declaredPapers?: number; fingerprint?: string; dataDir?: string }
+      // t6 低危 F8：**必须** typeof 字符串 + 枚举（原先 String(body.choice) 会把 ['asked'] 强转成 'asked' 放进来）
+      if (typeof body.choice !== 'string' || !['asked', 'later', 'declined', 'idle'].includes(body.choice)) {
+        json(res, 400, { error: 'choice 必须是 asked / later / declined / idle', code: 'bad-request' })
+        return
+      }
+      // t8 R5：`body.dataDir` 缺失时用**当前判据**兜底（`need.dataDirId`）—— 否则会记下一条「门不认」的回答：
+      // 卡片按钮在快照加载完成前就会渲染（真实可达路径），此时 `dataDir=null` ⇒ 门按「不是同一个库」判 ⇒
+      // 界面上写着「不会再主动询问」、下一拍 GET 却仍然 ask（评审 G14）。兜底只在缺字段时走一次判据。
+      const bodyDir = typeof body.dataDir === 'string' && body.dataDir ? body.dataDir : null
+      let need = bodyDir === null ? detectMigrationNeed(dataDir) : null
+      const needOf = (): ReturnType<typeof detectMigrationNeed> => need ?? (need = detectMigrationNeed(dataDir))
+      const dirId = bodyDir ?? needOf().dataDirId
+
+      // `idle` = 「重新检查」的另一种写法（清掉回答）。willAsk 由**门控**推导（见下），不靠 state.choice 猜。
+      if (body.choice === 'idle') {
+        const state = resetPromptState()
+        const decision = decideMigrationPrompt(needOf(), state)
+        json(res, 200, { ok: true, state: promptStatePayload(state), willAsk: decision.level === 'ask' })
+        return
+      }
+
+      // F3（t6）+ t8 R2/R3：`declined` 是**吸态**，但作用域是「**同一个库**」——
+      //   · 同一库：任何**弱回答**（asked / later）都不许把它降级（否则两个标签页就能把「不再提醒」复活）；
+      //   · 换库（库根 realpath 不同）：上一条回答与这个库无关 ⇒ 必须允许把新库的 asked 记进去并更新 dataDir，
+      //     否则裁定 (b)「换库要重新问」的**界面半边**永远落不了地（服务端会问、界面记不上 ⇒ 每次渲染都问）。
+      // 拒绝降级不是错误（200），但 willAsk=false 明确告诉调用方「这个库不会再问」。
+      const prev = readPromptState()
+      const sameLibrary = prev.dataDir !== null && prev.dataDir === dirId
+      const weakAnswer = body.choice === 'asked' || body.choice === 'later'
+      if (sameLibrary && prev.choice === 'declined' && weakAnswer) {
+        json(res, 200, { ok: true, state: promptStatePayload(prev), willAsk: false, refused: 'declined' })
+        return
+      }
+      // 未给指纹/篇数时**保留**上一份（否则界面只发 {choice:'asked'} 会把「同一指纹不再问」的门拆掉）；
+      // 库身份则一律写成这次判定的那个（缺字段时是兜底值）——「这条回答属于哪个库」必须确定。
+      const patch: {
+        choice: 'asked' | 'later' | 'declined'; at: string; by: 'ui'
+        declaredPapers?: number; fingerprint?: string; dataDir: string
+      } = { choice: body.choice as 'asked' | 'later' | 'declined', at: new Date().toISOString(), by: 'ui', dataDir: dirId }
+      if (typeof body.declaredPapers === 'number' && Number.isFinite(body.declaredPapers)) patch.declaredPapers = body.declaredPapers
+      if (typeof body.fingerprint === 'string' && body.fingerprint) patch.fingerprint = body.fingerprint
+      const written = writePromptState(patch)
+      const state = promptStatePayload(written.state)
+      // t8 R5：`willAsk` 由**门控推导**（拿写后的状态再过一次 decide），不用 `state.choice === 'idle'` 猜 ——
+      // 应答里的「还会不会再问」必须与 GET 的实际门控一致（评审 G14 就是这条不一致）。
+      const decision = decideMigrationPrompt(needOf(), written.state)
+      json(res, 200, { ok: written.ok, state, willAsk: decision.level === 'ask' })
+      return
+    }
+
+    if (sub === '/api/library/migrate-prompt' && req.method === 'DELETE') {
+      const state = resetPromptState()
+      const decision = decideMigrationPrompt(detectMigrationNeed(dataDir), state)
+      json(res, 200, { ok: true, state: promptStatePayload(state), willAsk: decision.level === 'ask' })
       return
     }
 

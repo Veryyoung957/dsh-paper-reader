@@ -558,7 +558,9 @@ test('B10 UI 静态契约：非空专题走 clear-plan → clear、清单来自�
   assert.match(client, /clearEndpoint/, '服务端 409 的下一步指引要被 UI 用上（竞态时改走清空）')
   assert.match(client, /delTopicClearConfirm/, '确认按钮文案必须存在')
   assert.match(client, /plan\.papers\.map/, '确认框清单必须逐篇来自服务端返回的 papers')
-  assert.match(client, /requireText: delDlg\.kind === 'paper' \? undefined : delDlg\.name/, '手输专题名确认保留在清空/删除这一步')
+  assert.doesNotMatch(client, /requireText|delTopicTypeName/, '清空/删除不再要求输入专题名')
+  assert.match(client, /t\('delWarning'\)/, '确认前明确警示回收站语义')
+  assert.match(client, /confirmName: d\.name/, '单击仍携带服务端确认名称')
   assert.ok(!/window\.(confirm|prompt)\s*\(/.test(client), '不得使用 window.confirm/prompt（Electron 不支持）')
   assert.match(client, /createPortal\(/, '弹窗必须走页内 portal')
   // 清空确认框要能提示「会被服务端拦下」的篇名（translation.busy / sessions.running）

@@ -756,7 +756,8 @@ export function deleteTopic(dataDir: string, name: unknown, renameImpl?: RenameI
 // ── 批量清空专题（上游评论第 10 条：非空专题删除的中间态）─────────────────────
 // 产品决策（上游已定）：30 篇论文的专题 = 30 次删除确认太重。清空 = **一次确认**，逐篇走
 // **同一套**回收站语义（精确 stem、`.pdf` 最后移、绝不 unlink）、仍受会话/翻译前置 409 约束。
-// 手输专题名确认保留在清空这一步（不放松确认强度）。
+// 本轮起 UI 不再要求手输专题名：改为「可见警示 + 点一次确认」；服务端仍比对 confirmName
+//（由点击携带，接口与确认强度不放松）。
 
 export interface TopicClearPaperPlan {
   name: string

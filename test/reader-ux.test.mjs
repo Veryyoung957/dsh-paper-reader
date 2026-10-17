@@ -912,7 +912,7 @@ test('F1 i18n：zh/en 键完全对齐；代码里用到的每个 t(key) 都有�
   const undef = [...used].filter((k) => !zh.has(k))
   assert.deepEqual(undef, [], `使用了未定义的 i18n 键：${undef.join(', ')}`)
   for (const k of ['renamePaper', 'renameTopic', 'delPaper', 'delTopic', 'delConfirmTitle', 'delConfirmBody',
-    'delNotDeleted', 'delToTrash', 'delTopicTypeName', 'delBusySession', 'delBusyTranslate',
+    'delNotDeleted', 'delToTrash', 'delTopicWarning', 'delBusySession', 'delBusyTranslate',
     'delTopicNotEmpty', 'renameDetached', 'renameTargetExists', 'eqTitle', 'eqTranscribe']) {
     assert.ok(zh.has(k) && en.has(k), `契约要求的 i18n 键缺失：${k}`)
   }
@@ -920,7 +920,7 @@ test('F1 i18n：zh/en 键完全对齐；代码里用到的每个 t(key) 都有�
 
 test('F2 i18n 用法：删除/重命名文案在 UI 里真的被引用（不是死键）', () => {
   const src = readFileSync(join(ROOT, '..', 'lib', 'client.js'), 'utf8')
-  for (const k of ['delConfirmTitle', 'delConfirmBody', 'delNotDeleted', 'delToTrash', 'delTopicTypeName',
+  for (const k of ['delConfirmTitle', 'delConfirmBody', 'delNotDeleted', 'delToTrash', 'delTopicWarning',
     'delBusySession', 'delTopicNotEmpty', 'renamePaper', 'renameTopic', 'renameDetached']) {
     assert.ok(new RegExp(`t\\('${k}'\\)`).test(src), `${k} 应在 UI 中被使用`)
   }

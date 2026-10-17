@@ -9,6 +9,11 @@
 // 依赖：跑前先 `npm run build`（脚本会在每次注入 src/ 后自动重建 dist）。
 //
 // 这是**证据工具**，不是 `npm test` 的一部分（名字不匹配 `test/*.test.mjs`，测试运行器不会自动捡它）。
+//
+// ⚠️ **必须在 LF 检出里运行**（评审 F10 的方法学更正）：本表有多条变异锚点是**多行**字符串，
+//    而本仓库 `core.autocrlf=true` 的检出把源文件写成 CRLF ⇒ 锚点会「命中 0 次」。
+//    那是**显式 FAIL**（不静默），所以复现者看到一批 `锚点命中 0 次` 时先查行尾，别当成回归。
+//    真 LF 检出可用：`git -c core.autocrlf=false worktree add --detach <dir> <sha>`。
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
@@ -239,6 +244,78 @@ const MUTATIONS = [
     from: "    ? managedEntries(paperDirAbs, (n) => n.startsWith('.') && !artifactNames.has(n))",
     to: "    ? managedEntries(paperDirAbs, (n) => n.startsWith('.'))",
     why: 't2 自查修掉的缺陷：隐藏条目与产物清单重复 ⇒ 点开头论文名删除时 500 回滚' },
+  // ── M 未迁移提示（t2 的新行为；靶子 = test/migrate-prompt.test.mjs，改回缺陷态必须变红）──
+  { id: 'M1-ask-once-removed', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P6 ',
+    from: "    if (state.fingerprint && state.fingerprint === need.fingerprint) {", to: "    if (false) {",
+    why: '去掉 ask-once 判断（每次都问）：同一 fingerprint 第二次调用又会 ask' },
+  { id: 'M2a-no-scan-trust-marker', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P3 ',
+    from: "  } else state = paperDirs > 0 ? 'migrated' : 'empty'", to: "  } else state = markers.done ? 'migrated' : 'unmigrated'",
+    why: '只看标记（没有 .done 就当未迁移）⇒ 无标记但已是新布局被误报' },
+  { id: 'M2b-trust-done-marker', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P8 ',
+    from: "    if (byClass.flat > 0 && markers.done) state = 'marker-mismatch'", to: "    if (byClass.flat > 0 && markers.done) state = 'migrated'",
+    why: '相信「已完成」标记、不看磁盘 ⇒ 标记说完成就闭嘴（漏报）' },
+  { id: 'M2c-residue-not-detected', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P9 ',
+    from: "        cls = files.every((f) => { const source = sizeOf(join(dir, f)); const target = sizeOf(join(folderDir, f)); if (source < 0 || target === -2) unreadable.push({ dir: rel || '.', cause: 'stat-failed' }); return source >= 0 && target >= 0 && target === source }) ? 'residue' : 'conflict'", to: "        cls = 'conflict'",
+    why: '不比对文件夹里的副本 ⇒ 半迁移残留（文件夹赢 + 平铺副本）被漏报成「需人工」' },
+  { id: 'M3-certain-ignored', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P12 ',
+    from: "  const certain = unreadable.length === 0 && !budgetExceeded", to: "  const certain = true",
+    why: '去掉 certain 判断（读不进去也发问/报数）⇒ 只读/无权限时误报' },
+  { id: 'M4-criterion-mkdirs', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P13 ',
+    from: "    try { const st = lstatSync(root); need = st.isDirectory() && !st.isSymbolicLink() ? scanOnce(root) : emptyNeed(root, 'unknown') }", to: "    try { need = scanOnce((mkdirSync(root, { recursive: true }), root)) }",
+    why: '判据自己 mkdir（等价于改用 resolveDataDir）⇒ 只读场景被写盘、库不存在也会被创建' },
+  { id: 'M5-report-executes', file: 'src/tools.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P16 ',
+    from: "import { formatMigrationReport, planMigration } from './migrate.ts'",
+    to: "import { formatMigrationReport, planMigration as _planMigration, runMigration } from './migrate.ts'\nconst planMigration = (d: string) => { runMigration(d); return _planMigration(d) }",
+    why: 'migration_report 偷偷执行迁移（红线①被破）⇒ 夹具库必须变红' },
+  { id: 'M6-fingerprint-without-class', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P7b ',
+    from: "  const lines = hits.map((hh) => `${hh.dir ? `${hh.dir}/` : ''}${hh.stem}|${hh.cls}`).sort()",
+    to: "  const lines = hits.map((hh) => `${hh.dir ? `${hh.dir}/` : ''}${hh.stem}`).sort()",
+    why: '指纹去掉分类 ⇒ 从「残留」恶化为「冲突」反而不再提示（用户看不到新的冲突）' },
+  { id: 'M7-text-without-count', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P1 ',
+    from: "  return `【布局提示】文献库还是旧（平铺）布局：还有 ${n} 篇论文的产物散落在专题目录里（共 ${f} 个文件）。\\n`",
+    to: "  return `【布局提示】文献库还是旧（平铺）布局：有论文的产物散落在专题目录里。\\n`",
+    why: '文案去掉篇数 ⇒ 用户不知道到底还有几篇' },
+  { id: 'M8-zh-only', file: 'lib/client.js', needsBuild: false, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P21 ',
+    from: "migViewStatus: 'View paper status',", to: "",
+    why: '只加 zh 不补 en（en 文案缺键）' },
+  // ── N t6 repair-round-2（评审 F1–F6 的修复；靶子 = test/migrate-prompt.test.mjs 的 P27–P33）──
+  { id: 'N1-ask-write-not-shared', file: 'lib/client.js', needsBuild: false, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P27 ',
+    from: "      useEffect(() => { migMarkAsked(snap) }, [snap])", to: "      void snap",
+    why: '裁定 (c) 回退：把「渲染问句 ⇒ 记 asked」只留在横幅 ⇒ rail 态（只挂 S2）再也不会记 asked ⇒ 每开一次设置就问一次' },
+  { id: 'N2-mirror-not-selfconsistent', file: 'lib/client.js', needsBuild: false, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P30 ',
+    from: "  if (prompt.level === 'ask' && (choice === 'asked' || choice === 'later' || choice === 'declined')) {", to: "  if (false) {",
+    why: 'F5 回退：镜像直接按旧的 prompt.level 渲染 ⇒ 刷新首帧闪一个「已经问过」的问句' },
+  { id: 'N3-empty-rule-reverted', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P31 ',
+    from: "  } else state = paperDirs > 0 ? 'migrated' : 'empty'", to: "  } else state = markers.done || paperDirs > 0 ? 'migrated' : 'empty'",
+    why: 'F6 回退：空库 + 陈旧 .done 又会被判 migrated ⇒ 界面对空库下「已是新布局」的结论' },
+  { id: 'N4-intro-caliber-reverted', file: 'lib/client.js', needsBuild: false, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P29 ',
+    from: "t('migPending').replace('{n}', String(need.papers))", to: "t('migPending').replace('{n}', String(0))",
+    why: '裁定 (a) 回退：弹层篇数改回少算的 plan.totals.papers ⇒ 同一屏两个数字（横幅 3 / 弹层 0）' },
+  // t8：N5 拆两半（队长点名 —— 旧 N5 只回退 asked 那一半守卫，盯不到 R3「later 覆盖 declined」）
+  { id: 'N5a-asked-can-downgrade-declined', file: 'src/host.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P28 ',
+    from: "      const weakAnswer = body.choice === 'asked' || body.choice === 'later'", to: "      const weakAnswer = body.choice === 'later'",
+    why: 'R3 回退（asked 半边）：迟到的 asked 能把同库的 declined 降级回 asked ⇒ 用户答过「不用」却仍被问' },
+  { id: 'N5b-later-can-downgrade-declined', file: 'src/host.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P35 ',
+    from: "      const weakAnswer = body.choice === 'asked' || body.choice === 'later'", to: "      const weakAnswer = body.choice === 'asked'",
+    why: 'R3 回退（later 半边）：弱回答「以后再说」仍能击穿 declined 吸态（评审 G5-later / C11 的缺陷态）' },
+  { id: 'N7-single-axis-dedupe-key', file: 'lib/client.js', needsBuild: false, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P34 ',
+    from: "      const key = `${dir}|${fp}`", to: "      const key = fp",
+    why: 'R1 回退：去重键退回单轴指纹 ⇒ 换到「同形状的另一个库」不记账（界面反复问、对话侧再问）' },
+  { id: 'N8-idle-guard-revived', file: 'lib/client.js', needsBuild: false, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P34 ',
+    from: "      if (!snap || snap.prompt?.level !== 'ask') return Promise.resolve(null)", to: "      if (!snap || snap.prompt?.level !== 'ask' || (snap.state && snap.state.choice !== 'idle')) return Promise.resolve(null)",
+    why: 'R1 回退：记账条件退回「state.choice 必须是 idle」自己判一遍（单轴）⇒ 同库指纹变化后服务端说 ask 却 0 次 POST' },
+  { id: 'N9-effective-choice-ignored', file: 'lib/client.js', needsBuild: false, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P34 ',
+    from: "  if (dir && need && need.dataDirId && dir !== need.dataDirId) return 'idle'", to: "  if (false) return 'idle'",
+    why: 'R1 回退：界面按**另一个库**留下的 declined 把问句藏起来 ⇒ 新库的问句永远不显示（漏问）' },
+  { id: 'N10-refuse-not-library-scoped', file: 'src/host.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P35 ',
+    from: "      const sameLibrary = prev.dataDir !== null && prev.dataDir === dirId", to: "      const sameLibrary = true",
+    why: 'R2 回退：拒降级不看库作用域 ⇒ 库 A 的 declined 会挡住库 B 的 asked（裁定 b 的界面半边落不了地）' },
+  { id: 'N11-datadir-no-fallback', file: 'src/host.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P35 ',
+    from: "      const dirId = bodyDir ?? needOf().dataDirId", to: "      const dirId = bodyDir ?? ''",
+    why: 'R5 回退：缺 dataDir 时不兜底 ⇒ 记下一条「门不认」的回答（界面说不会再问、GET 却仍 ask = 评审 G14）' },
+  { id: 'N6-identity-axis-ignored', file: 'src/migrate-prompt.ts', needsBuild: true, testFile: 'test/migrate-prompt.test.mjs', pattern: 'P32 ',
+    from: "  const sameLibrary = state.dataDir !== null && state.dataDir === need.dataDirId", to: "  const sameLibrary = true",
+    why: '裁定 (b) 回退：不看库身份 ⇒ 「同形状的另一个库」被当成已经问过 ⇒ 静默漏提示' },
 ]
 
 const args = process.argv.slice(2)

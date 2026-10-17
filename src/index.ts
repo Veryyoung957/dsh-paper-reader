@@ -13,7 +13,7 @@ export const inject = ['tools']
 
 export function apply(ctx: Context, config: PluginConfig = {}) {
   registerTools(ctx, config)
-  console.log(`[dsh-paper-reader] registered tools: list_papers, transcribe_pdf, search_paper, study_progress, study_update`)
+  console.log(`[dsh-paper-reader] registered tools: list_papers, transcribe_pdf, search_paper, study_progress, study_update, migration_report, migration_prompt_choice`)
 
   // webServer 是可选服务（web profile 有，headless 没有）：出现时再挂路由。
   // connection/sessionController/workspaceController/workspaceRegistry 同属 web profile（cordis 要求访问前先声明 inject）。

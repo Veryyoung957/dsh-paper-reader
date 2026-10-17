@@ -8,6 +8,7 @@ The README lists only the core capabilities; prerequisites, costs, known limitat
 - [Embedding semantic search](#embedding-semantic-search)
 - [Selection translation (formulas preserved)](#selection-translation-formulas-preserved)
 - [Bilingual split view (two modes)](#bilingual-split-view-two-modes)
+- [Per-paper folders: status and migration confirmation](#per-paper-folders-status-and-migration-confirmation)
 - [Library management details](#library-management-details)
 
 ## MinerU parsing: scanned PDFs & click-to-cite formulas
@@ -80,10 +81,31 @@ Two toolbar buttons; switch any time and **click again to return to the original
 - **Width**: the split view needs a panel at least **640px** wide; narrower, clicking "分屏" only explains and does **not** switch. Shrinking below 640px while split falls back to the original automatically.
 - **Interaction with existing features**: while split, the left pane is the ordinary original view — **formula hotspots stay clickable** (the right pane neither participates in hit-testing nor gets a hotspot layer), the formula panel keeps working, and the "中" toggle is disabled during split (to avoid conflicting semantics). Switching to the Chinese / dual view still disables hotspots, exactly as before (the bbox only holds for original pages).
 
+## Per-paper folders: status and migration confirmation
+
+The new layout keeps each paper's PDF/translations/transcript/study file in `<topic>/<paper>/`; the old layout (artifacts flat inside the topic folder) keeps working, and the plugin **only notifies — it never migrates automatically**.
+
+**Where**: the sidebar banner or the migration card under **Settings → Paper Reader** → **View paper status** opens the per-paper status panel. It lists every paper by topic with three status items, each of which only ever takes one of three values: Complete / Incomplete / Unknown.
+
+| Status item | What "Complete" means |
+| --- | --- |
+| Translation | **both** the Chinese-only PDF and the bilingual PDF exist for that paper; having just one is still incomplete (`-en` and leftover `.tmp-*` never count) |
+| MinerU transcription | that paper has a complete MinerU submission (transcript, page map and Markdown/JSON all readable and non-empty); the default pdf.js text cache is **not** a MinerU completion |
+| Migration | the paper already sits in its own folder and no flat artifacts of it are left in the topic folder |
+
+- **Unknown never means complete**: an unreadable folder (permissions), a damaged artifact, or a library too large to finish scanning shows **Unknown** — the plugin will not treat it as complete, and it will not claim an exact library-wide count; it says that some folders are unreadable or not fully scanned instead.
+- **This is a file-level check**: it only confirms that artifacts exist and are readable, not content quality. A paper showing "Incomplete" because no translation endpoint or no MinerU is configured is normal, and **the old layout keeps working either way** (listing, opening, searching, deleting and renaming are unaffected).
+- **Refresh status** re-scans; the panel pages on demand (topics collapsed by default, **Load more** expands page by page). Opening, refreshing, paging and closing the panel never executes a migration.
+
+**How to migrate**: the panel's footer states the costs and the guarantees — files are copied into the paper folder first and the old sources are removed **only after verification**, conflicts are never overwritten and need manual handling, back up first, and the run is interruptible, repeatable and reversible using its log. After reading that warning, **one click** on **Confirm migration** executes it; the button is disabled with the reason stated while loading, if the check failed, if the status is unknown, or if nothing can be settled automatically. The result reports only success / partially complete / failure plus the log location — not per-paper reasons — then refreshes the per-paper statuses; a partial run keeps the "needs manual handling" note.
+
+> Choose **Not now** / **Don't ask again** to skip, and change your mind later via **Re-check** in the settings card — the same library in the same state is never asked about twice. The CLI keeps its read-only dry-run report (executing requires an explicit `--apply --yes`), and the agent keeps its read-only `migration_report`.
+
 ## Library management details
 
 - Deletion = **moved to trash** `data/.trash/<timestamp>/` (with a manifest); move files back into the topic folder to recover. No auto-cleanup or one-click restore UI in this version
 - Files moved to trash = the paper's same-named artifacts: `<paper>.pdf`, `.txt`, `.pages.json`, `.transcript.json`, `.mineru.md`, `.mineru.json`, `.embeddings.json`, `.study.json`, plus translation variants `<paper>-en.pdf` / `-zh.pdf` / `-dual.pdf` (including leftover `.tmp-*`); chat history is **not** deleted (it lives in dsh's session store)
+- **How deletion is confirmed**: deleting a paper, deleting an empty topic and clearing a non-empty topic all fetch the server-side plan and per-file list first, and the warning states that the files move to trash (recoverable) while chat history is kept; review the scope and **confirm once** — typing the topic name is no longer required (the server still validates independently against mis-calls)
 - **Preconditions**: deletion/rename is refused while the paper has a running session, a translation in progress, or another delete/rename in flight
 - **Safety boundary**: deletes/renames only ever touch the library directory; path traversal (`..`, absolute paths, symlink escapes) is rejected; a mid-way failure rolls back already-moved files
 - After a rename: transcripts/translations/study profiles move along; past chat sessions are **kept** but no longer listed under the new name (session ids encode the old name); case-only renames work on macOS/Windows

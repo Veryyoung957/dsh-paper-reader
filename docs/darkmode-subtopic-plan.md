@@ -541,7 +541,7 @@ setThemeModeLight / setThemeModeDark / setThemeStrength / setThemeStrength1..4 /
 | 27 | `sessionPrefixFor()` | `src/host.ts:217-218` | `base64url(topic + '/' + name)` 自动接受路径；但**改名会脱钩**（§B1.4） |
 | 28 | 改名搬家（前端 localStorage） | `lib/client.js:250-281` | 保留键格式；把"前缀匹配"改成"按已知 (topic,name) 对精确搬"（§B2.4） |
 | 29 | 阅读器内 `variantKey()` | `reader/index.html:336`（定义）、`:372-374`（读/回写）、`:501`（写） | 键格式不变（§B2.4 已证歧义不可达） |
-| 30 | 删除计划 UI / 确认流 | `lib/client.js:1076` 附近（`doDelete` 注释）、`docs/reader-ux-requirements.md §2.8-2.9` | 删除单篇论文的**用户可见语义不变**（仍是"计划 → 手输确认 → 批量移入回收站"），只是搬的是目录 |
+| 30 | 删除计划 UI / 确认流 | `lib/client.js:1076` 附近（`doDelete` 注释）、`docs/reader-ux-requirements.md §2.8-2.9` | 删除单篇论文的**用户可见语义不变**：仍是"计划 → 确认 → 批量移入回收站"，只是搬的是目录。**（本轮取代：原句为"计划 → 手输确认 → 批量移入回收站"；键入专题名已取消，见 §B2.2 的本轮注记）** |
 
 ### B1.4 旧布局是否仍需可读（结论 + 代价）
 
@@ -623,7 +623,7 @@ validateTopicPath(raw):
 | `POST /api/library/delete-topic`（别名 `…/topic/delete`） | `src/host.ts:682` | **叶子语义不变**；返回体里的 `clearEndpoint` 指向清空（`:707`） |
 | `POST /api/library/rename-topic`（别名 `…/topic/rename`） | `src/host.ts:728` | `to` 接受路径 ⇒ 天然支持"移动到另一父"；**新增**"拒绝移入自身子树"（409 `bad-request`） |
 | `GET /api/library/topic/clear-plan?topic=` | **基线已有**：`src/host.ts:769-806` | 计划里**新增** `subtopics` 与逐子树的合并清单（叶子专题行为不变） |
-| `POST /api/library/topic/clear` | **基线已有**：`src/host.ts:811-846`（`confirmName` 手输确认 + `planTopicClear` + `clearTopic`，`withInflight('topic\u0000…')`） | 支持**子树**：按后序遍历，先清各子专题（各自独立 bundle）再清本层，最后非递归 rmdir（§B2.2 末） |
+| `POST /api/library/topic/clear` | **基线已有**：`src/host.ts:811-846`（`confirmName` 匹配 + `planTopicClear` + `clearTopic`，`withInflight('topic\u0000…')`）。**（本轮注：原写作「`confirmName` 手输确认」——UI 已不再要求键入专题名，但 `confirmName` 仍随点击携带、服务端仍比对，接口不放松）** | 支持**子树**：按后序遍历，先清各子专题（各自独立 bundle）再清本层，最后非递归 rmdir（§B2.2 末） |
 | 其余（`/api/pdf`、`/api/ask`、`/api/paper`、`/api/transcribe`、`/api/formulas`、`/api/translate-selection`、`/api/sessions*`） | — | `topic` 是路径后语义自然成立，**不改协议** |
 
 > ⚠️ **重要更正（我第一版把已存在的功能写成了"新增"）**：基线 `ec21969` **已经有**一整套
@@ -649,7 +649,11 @@ validateTopicPath(raw):
 `entries`（⇒ 非空），`deleteTopic` 报 `topic-not-empty`，且**拒绝后目录与子目录都还在**。
 所以"叶子/非叶子"的区别今天就已经被 rmdir 兜住了；嵌套子专题只需要新增"删除非空子树"的**显式**路径。
 
-**删除非空子树怎么走既有的「删除计划 + 批量清空 + 手输确认」（冻结；**在既有实现上扩展，不重写**）**：
+**删除非空子树怎么走既有的「删除计划 + 批量清空 + 一次点击确认」（冻结；**在既有实现上扩展，不重写**）**：
+
+> ⚠️ **本轮取代（原标题末为「+ 手输确认」）**：UI 侧不再要求输入专题名，改为「服务端计划与逐篇文件清单 +
+> 可见警示 + **点一次**确认」。下面第 3 条里的「手输确认」按此理解：服务端的 `confirmName === topicPath`
+> 比对**保留不变**（仍由点击携带，接口不放松），变的是**用户不再键入**。
 
 基线已有链路（逐行）：`GET /api/library/topic/clear-plan`（`src/host.ts:769-806`）→ 前端三步确认
 （`lib/client.js:1073-1175`）→ `POST /api/library/topic/clear`（`src/host.ts:811-846`）→
@@ -662,7 +666,8 @@ validateTopicPath(raw):
    "每篇一个子目录"设计一致，天然避免跨篇/跨专题同名撞名，见 `src/library-manage.ts:644-667`），
    再清本层论文，最后非递归 `rmdirSync`（`:699`）。任一节点失败 ⇒ 沿用既有的"失败即回滚"口径
    （`:648-651`：把本次已移动的全部文件 rename 回原位，回滚失败的进 `rollbackFailed` 并在回收站里）。
-3. **确认强度不放松**：手输确认仍是 `confirmName === topicPath`（`src/host.ts:815` 附近；失败 400 不是 409）。
+3. **确认强度不放松**（**本轮改写**）：服务端仍是 `confirmName === topicPath`（`src/host.ts:815` 附近；失败 400 不是 409），
+   但**用户不再键入专题名**——它由面板上的一次点击携带（原「手输确认仍是 `confirmName === topicPath`」的 UI 部分已取代）。
    ⚠️ 我第一版设计的 `confirmToken=sha256(...)` **不要引入** —— 基线用的是 `confirmName` 字面比对，
    另造一套 token 会产生两种确认语义。
 4. `withInflight` 键仍是 `topic\u0000<topicPath>`（`src/host.ts:811-846` 内），但**必须同时**占用子树内
@@ -874,7 +879,7 @@ validateTopicPath(raw):
 | B11 | 重命名论文：目录 + 内部文件名一起改，不产生脏名 | ✅ `/tmp` |
 | B12 | 子专题：可建 ≥3 层、可重命名、可移动（含移动到另一父） | 🔬 真机 |
 | B13 | **非递归 rmdir 不变量**：含子目录的专题删除被 409 拒绝，且目录完好 | ✅ 已实测（`c-` S1） |
-| B14 | 清空子树：计划 + 手输确认 + 批量回收站；token 不符报 409 | 🔬 真机 |
+| B14 | 清空子树：服务端计划与逐篇文件清单 + 可见警示 + **一次点击**确认 + 批量回收站；`confirmName` 不匹配按 §B2.2 第 3 条报 400（**本轮改写：原为「计划 + 手输确认 + 批量回收站；token 不符报 409」——手输已取消，且原写的 409 与第 3 条自相矛盾，标为待核**） | 🔬 真机 |
 | B15 | 穿越矩阵 18 条全过；realpath/symlink 三层防护未被绕 | ✅ 已实测 |
 | B16 | 子树内任一论文有运行中会话 ⇒ 409；翻译中 ⇒ 409 | 🔬 真机 |
 | B17 | 改名/移动专题**必须**提示脱钩会话数 | ✅ 已实测 13 个 + 🔬 真机 |

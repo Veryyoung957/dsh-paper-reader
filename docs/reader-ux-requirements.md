@@ -330,6 +330,7 @@ REJECT otherwise
 | S8 | **进行中翻译 ⇒ 409 拒绝**：目标文献 `zhStatus(ref).busy === true` 时拒绝删除/重命名（`code:'translation-busy'`）。理由：babeldoc 完成后会 `rename(tmpDir/…, dstStem+'-zh.pdf')` 回写文献目录（`src/translate.ts:225-231`），删除后回写会**复活**文件，重命名后回写会写进已废弃的名字。 | 源码证据 |
 | S9 | **UI 二次确认**：必须用页内 portal 弹窗（`AskText` 先例，`lib/client.js:530-554`），**禁止** `window.prompt/confirm`（Electron 渲染进程不支持 prompt，见 `lib/client.js:707-708` 的实测注释）。弹窗必须列出**将要处理的文件清单与大小**（来自 dry-run 接口）与**不删的东西**（原文表述：「会移入回收站，可恢复；伴读会话历史不会被删除」）。 | 源码证据 + 决策 |
 | S10 | **专题删除要输入专题名确认**（type-to-confirm）；文献删除为「破坏性按钮 + 明确的移入回收站文案」（一篇文献一屏可列全，输入名字反而增加误操作成本）。 | 决策 |
+| S10′ | **（本轮取代 S10 的前半句）** 删除空专题 / 清空非空专题：仍先取服务端计划与逐篇文件清单、仍写明「移入回收站（可恢复）、伴读会话历史不删」，但**不再要求输入专题名**——警示可见后**点一次**执行；`confirmName` 仍随点击携带、服务端仍比对（接口不放松）。文献删除部分不变。理由：取消键入降低的是防误触强度，由可见警示、默认焦点落在「取消」、busy 去重与服务端栅栏补偿。 | 决策（本轮修订） |
 | S11 | 二次确认的**数据必须来自服务端 dry-run**（`delete-plan`），前端不得自行拼文件列表（避免前后端清单漂移）。 | 防「文案说删 3 个，实际删 8 个」 |
 | S12 | 重命名 `newName` 不得以 `-en/-zh/-dual` 结尾（否则新名字会被 `isPaperPDF` 判定为非文献 → 文献从库里消失，`src/library.ts:33-40`）。 | 源码证据 |
 | S13 | 重命名目标已存在 ⇒ 409 `target-exists`；**大小写-only 改名**（`realpath(源)===realpath(目标)`）放行（macOS/Windows 大小写不敏感文件系统）。 | 兼容性 |
@@ -364,7 +365,8 @@ REJECT otherwise
 >    `delete-paper {topic,name}`；我们的别名调用方继续发 `{name,newName}` 一族。handler 内取 `name ?? topic`、`newName ?? to`。
 >    `rename-topic` 的响应额外补一个 `topic`（上游读法），其余响应形状以本节为准。
 > 3. **UI 落点由 `⋯` 菜单改为行内 `✎`/`🗑`**（见 §2.9 的修订说明），删除确认仍然是「服务端 `delete-plan` 清单 + 页内 portal 弹窗 +
->    专题手输名」——替换掉的是上游的「点两次（3 秒窗口）」arm 交互。
+>    可见警示 + 一次点击」——替换掉的是上游的「点两次（3 秒窗口）」arm 交互。
+>    **（本轮取代：原句末为「+ 专题手输名」；不再键入专题名，见 §2.6 的 S10′ 与 §2.9。）**
 >
 > 当前真实状态以 **[docs/mineru-integration.md](mineru-integration.md) §1.6 B / §1.7 / §1.8** 为准（那里是交付面同步）。
 > **本节其余内容（含 §2.1–§2.7 的取舍与 §2.8 各条的状态码表）一律保留、不改写。**
@@ -445,7 +447,8 @@ dry-run，给确认弹窗用。
 > 整合时按既定方向保留**上游 v1.3.0 的 UI 入口**：专题行与文献行各自行内两个按钮 `✎`（重命名）/ `🗑`（删除），
 > 悬停出现（`data-dpr-act`），**不再有 `⋯` 下拉菜单**（我们原先的 `menu`/`inlineMenu`/`renDlg` 已删除）。
 > `🗑` **一击**即打 `GET /library/paper/delete-plan` 拿服务端清单，然后弹**同一个页内 portal 确认框**
-> （`ConfirmDelete`，含 `requireText` 手输专题名）；上游原版的「同一按钮点两次（3 秒 arm）」按既定裁定删除
+> （`ConfirmDelete`；**本轮取代：原句为「含 `requireText` 手输专题名」，该输入已移除**——改为可见警示 + 一次点击，
+> `confirmName` 仍随点击携带、服务端仍比对）；上游原版的「同一按钮点两次（3 秒 arm）」按既定裁定删除
 > （`armDel`/`clickDelete`/`data-dpr-armed` 零残留，由 `.probe/deploy-check.mjs` 断言）。
 > **下面「弹窗内容实例」「i18n 文案」这些设计意图全部保留**（清单仍逐条列出、仍写明「不会删除」项）；
 > 变的是触发它的是行内 `🗑` 而不是 `⋯` 菜单项。其余内容**不改写**。
@@ -467,6 +470,7 @@ dry-run，给确认弹窗用。
   ```
   （文件数与字节数**必须来自 `delete-plan` 的响应**，不许前端自己算。）
 - 删除专题：额外要求输入专题名；非空专题直接弹「专题内还有 N 篇文献」并禁用删除按钮（来自 409 的 `papers`，或先调 plan）。
+  - **（本轮取代上面这条）** 不再要求输入专题名：删除空专题、清空非空专题都先取服务端计划与逐篇文件清单，可见警示写明「移入回收站（可恢复）、伴读会话历史不删」，确认范围后**点一次**执行；若确认前范围变了（非空竞态），必须重新展示新的清空计划，不得沿旧确认扩大范围；计划失败不得执行，busy 期间禁止重复点击。
 - 重命名后：`refresh()`（`565-567`）+ 若被改名的是当前文献，更新 `dpr.last`（`lib/client.js:561,188`）与 `dpr.sessionN.*` 键值前缀（否则会话序号错位）。**【必须实现】**：`lib/client.js:604` 用 `` `dpr.sessionN.${topic}/${name}` `` 读序号。
 
 **i18n 键（`lib/client.js:29-86` 的 `zh`/`en` 两个扁平字典，`t(key)` 取值）**：
@@ -484,7 +488,7 @@ dry-run，给确认弹窗用。
 | `delConfirmBody` | 将移入回收站（可恢复）：共 {files} 个文件、{size} | Will be moved to trash (recoverable): {files} files, {size} |
 | `delNotDeleted` | 不会删除：伴读会话历史、共享翻译环境 | Not deleted: chat history, shared translation venv |
 | `delToTrash` | 移入回收站 | Move to trash |
-| `delTopicTypeName` | 请输入专题名「{name}」以确认 | Type the topic name "{name}" to confirm |
+| `delTopicTypeName` | ~~请输入专题名「{name}」以确认~~ **（本轮删除：不再键入专题名，改用可见警示 + 一次点击，新键 `delTopicWarning` / `delWarning`）** | ~~Type the topic name "{name}" to confirm~~ **(removed this round: no typed topic name; visible warning + one click, see `delTopicWarning` / `delWarning`)** |
 | `delDone` | 已移入回收站（{files} 个文件） | Moved to trash ({files} files) |
 | `delFail` | 删除失败 | Deletion failed |
 | `delBusySession` | 该文献有正在运行的会话，请先结束再删除 | A session is still running — end it first |
