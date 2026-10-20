@@ -88,6 +88,42 @@ const MUTATIONS = [
     to: '    if (!scanner) return { total: 0, running: 0, unknown: false }',
     detect: { kind: 'test', pattern: 'D5' },
   },
+  // ── 第二轮：t6 修复自身的回退靶子（每一条都对应 t4 的一条 finding）──
+  {
+    id: 'M6', why: 'F1 回退：rename 三路目标冲突判定短路 ⇒ 既有 legacy 文献被静默遮蔽',
+    file: 'src/library-manage.ts',
+    from: '  if (!dirHit && !flatHit && !artifactsHit) return',
+    to: '  if (true) return',
+    detect: { kind: 'probe', probe: 'R1' },
+  },
+  {
+    id: 'M7', why: 'F2 回退：混合态（论文夹 + 平铺残留）不再拒绝 ⇒ 删完变 legacy 幽灵',
+    file: 'src/library-manage.ts',
+    from: '  if (flat.length === 0) return',
+    to: '  if (true) return',
+    detect: { kind: 'probe', probe: 'R5' },
+  },
+  {
+    id: 'M8', why: 'F4 回退：ctx.get 抛错不再统一成 approval-unavailable（冒泡裸 Error）',
+    file: 'src/tools.ts',
+    from: "    svc = typeof get === 'function' ? (get.call(ctx, 'approval') as ApprovalAsk | undefined) : undefined\n  } catch {\n    throw approvalError(lang, 'unavailable', action)\n  }",
+    to: "    svc = typeof get === 'function' ? (get.call(ctx, 'approval') as ApprovalAsk | undefined) : undefined\n  } finally {\n    void 0\n  }",
+    detect: { kind: 'probe', probe: 'R10' },
+  },
+  {
+    id: 'M9', why: 'F3 回退：delete 的 dirRemoved 恒为 true ⇒ 目录未删净却报删净',
+    file: 'src/tools.ts',
+    from: '              ok: true, action, topic: plan.topic, name: plan.name, files: run.r.moved,\n              dirRemoved: run.r.dirRemoved,',
+    to: '              ok: true, action, topic: plan.topic, name: plan.name, files: run.r.moved,\n              dirRemoved: true,',
+    detect: { kind: 'probe', probe: 'R9' },
+  },
+  {
+    id: 'M10', why: 'F3 回退：move 丢弃 otherEntries ⇒ 用户自放条目被静默搬走',
+    file: 'src/tools.ts',
+    from: '              files: run.r.moved, otherEntries: run.r.otherEntries,',
+    to: '              files: run.r.moved, otherEntries: [],',
+    detect: { kind: 'probe', probe: 'R9' },
+  },
 ]
 
 console.log('[sandbox] 同步副本 + 基线构建 + 探针全绿检查 …')

@@ -110,7 +110,8 @@ const codeOf = (e) => (e instanceof ManageError ? e.code : `<non-ManageError:${e
 
 const results = []
 async function probe(id, fn) {
-  if (ONLY && !id.startsWith(ONLY)) return
+  // 精确匹配 + 「id 描述后缀」兼容（A/B/C/D/E 组的 id 形如 `A5 abort-during-approval`）
+  if (ONLY && id !== ONLY && !id.startsWith(ONLY + ' ') && !id.startsWith(ONLY + '-')) return
   try { await fn(); results.push({ id, ok: true }) } catch (e) { results.push({ id, ok: false, detail: e?.stack ?? String(e) }) }
 }
 const ONLY = (() => { const i = process.argv.indexOf('--only'); return i > 0 ? process.argv[i + 1] : null })()
@@ -191,8 +192,9 @@ await probe('A4 approval-channel-unavailable', async () => {
     const err = await catchErr(() => tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, exec))
     assert.ok(err, `${label} 竟然放行`)
     assert.deepEqual(snap(data), before, `${label} 下出现副作用`)
-    if (label !== 'ctx.get-throws') assert.equal(codeOf(err), 'approval-unavailable', `${label} 错误码 ${codeOf(err)}`)
-    else console.log(`  [观察] ctx.get 抛错时错误形状 = ${codeOf(err)}（fail-closed=${snap(data) && true}）`)
+    assert.equal(codeOf(err), 'approval-unavailable', `${label} 错误码 ${codeOf(err)}`)
+    // t6 修复（t4-F4）：ctx.get 自身抛错也必须带 [library_manage:*] 前缀（旧实现会冒泡裸 Error）
+    if (label === 'ctx.get-throws') assert.match(err.message, /^\[library_manage:approval-unavailable\]/, `ctx.get 抛错未被统一：${err.message}`)
   }
 })
 
@@ -570,8 +572,9 @@ await probe('C8-delete-topic-hidden-only', async () => {
 
 /* ═══════════════ D. 审批后置语义（授权后才发现冲突是否仍零副作用） ═══════════════ */
 
-// D1 rename 目标冲突发生在授权之后：必须零副作用，且错误码是 target-exists（不是 partial）。
-await probe('D1-rename-conflict-after-approval', async () => {
+// D1 rename 目标冲突：零副作用 + target-exists。t6 修复后**冲突在审批之前**判定（requests=0）；
+// 这条探针同时守「修复把成本从『多打扰一次』降到 0」与「零副作用」两个性质。
+await probe('D1-rename-conflict-zero-side-effect', async () => {
   const { data } = mkLib()
   newPaper(data, 'T', 'P')
   newPaper(data, 'T', 'Q')
@@ -580,8 +583,8 @@ await probe('D1-rename-conflict-after-approval', async () => {
   const before = snap(data)
   const err = await catchErr(() => tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'Q' }, execOf()))
   assert.equal(codeOf(err), 'target-exists', `错误码 ${codeOf(err)}`)
-  assert.deepEqual(snap(data), before, '授权后冲突仍有副作用')
-  assert.equal(ap.requests.length, 1, '（如实记录）这条冲突是在授权之后才发现的：用户被多打扰一次')
+  assert.deepEqual(snap(data), before, '冲突时仍有副作用')
+  assert.equal(ap.requests.length, 0, `t6 修复要求冲突在审批前拒绝，实际请求了 ${ap.requests.length} 次审批`)
 })
 
 // D2 rename 到自身同名 → 授权前就拒（不打扰用户）。
@@ -641,6 +644,299 @@ await probe('E1-no-migration-execution-path', async () => {
     assert.ok(err, `action=${a} 竟然被接受`)
   }
   assert.equal(existsSync(join(data, 'migration-logs')), false)
+})
+
+/* ═══════════════ R. 第二轮（t6 修复）新攻击面：三路改名冲突 / 混合布局拒绝 / 残留如实呈现 / 修复自身 TOCTOU ═══════════════ */
+
+const namesOf = (data, topic = 'T') => LIB.listPapers(data, topic).map((p) => `${p.name}${p.legacy ? '(legacy)' : ''}`).sort()
+const mixedPaper = (data, topic = 'T', name = 'P') => {
+  const dir = newPaper(data, topic, name)
+  writeFileSync(join(data, topic, name + '.pdf'), PDF('flat-' + name))
+  writeFileSync(join(data, topic, name + '.txt'), 'flat-cache')
+  return dir
+}
+
+// R1 F1 原始复现：改成一个被**旧布局**文献占用的名字 → 审批前 target-exists、零副作用、不遮蔽既有文献。
+await probe('R1-rename-legacy-target-blocked', async () => {
+  const { data } = mkLib()
+  newPaper(data, 'T', 'P')
+  mkdirSync(join(data, 'T'), { recursive: true })
+  writeFileSync(join(data, 'T', 'Q.pdf'), PDF('Q-legacy'))
+  writeFileSync(join(data, 'T', 'Q.txt'), 'Q-cache')
+  const ap = fakeApproval()
+  const { tool } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  assert.deepEqual(namesOf(data), ['P', 'Q(legacy)'])
+  const err = await catchErr(() => tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'Q' }, execOf()))
+  assert.equal(codeOf(err), 'target-exists', `错误码 ${codeOf(err)}`)
+  assert.deepEqual(snap(data), before, '冲突时有副作用')
+  assert.equal(ap.requests.length, 0, `冲突必须在审批前拒绝，实际请求审批 ${ap.requests.length} 次`)
+  assert.deepEqual(namesOf(data), ['P', 'Q(legacy)'], '既有 legacy 文献被遮蔽（t4-F1 未修复）')
+})
+
+// R2 目标是已存在的论文夹；R3 目标只剩孤儿 sidecar。
+await probe('R2-rename-folder-target-blocked', async () => {
+  const { data } = mkLib()
+  newPaper(data, 'T', 'P')
+  newPaper(data, 'T', 'Q')
+  const ap = fakeApproval()
+  const { tool } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  const err = await catchErr(() => tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'Q' }, execOf()))
+  assert.equal(codeOf(err), 'target-exists')
+  assert.deepEqual(snap(data), before)
+  assert.equal(ap.requests.length, 0)
+})
+await probe('R3-rename-orphan-target-blocked', async () => {
+  const { data } = mkLib()
+  newPaper(data, 'T', 'P')
+  writeFileSync(join(data, 'T', 'Q.mineru.json'), '{}')
+  writeFileSync(join(data, 'T', 'Q-zh.pdf'), 'variant-of-a-ghost')
+  const ap = fakeApproval()
+  const { tool } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  for (const target of ['Q']) {
+    const err = await catchErr(() => tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: target }, execOf()))
+    assert.equal(codeOf(err), 'target-exists', `孤儿产物目标未拒：${codeOf(err)}`)
+  }
+  assert.deepEqual(snap(data), before)
+  assert.equal(ap.requests.length, 0)
+})
+
+// R4 修复不能过度拦截：大小写-only 改名仍放行（Linux 大小写敏感 FS 上是真改名）。
+await probe('R4-case-only-rename-still-allowed', async () => {
+  const { data } = mkLib()
+  newPaper(data, 'T', 'P')
+  const ap = fakeApproval()
+  const { tool } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const out = await tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'p' }, execOf())
+  assert.equal(out.new_name, 'p', `大小写-only 改名被过度拦截：${out}`)
+  assert.deepEqual(namesOf(data), ['p'])
+})
+
+// R5/R6/R7 混合态三动作：layout-conflict、审批前拒绝、零副作用、不留旧身份。
+await probe('R5-mixed-delete-rejected', async () => {
+  const { data } = mkLib()
+  mixedPaper(data)
+  const ap = fakeApproval()
+  const { tool } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  assert.deepEqual(namesOf(data), ['P'])
+  const err = await catchErr(() => tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf()))
+  assert.equal(codeOf(err), 'layout-conflict', `错误码 ${codeOf(err)}`)
+  assert.deepEqual(snap(data), before, '混合态拒绝时有副作用')
+  assert.equal(ap.requests.length, 0, '混合态在审批前就应拒绝')
+  assert.deepEqual(namesOf(data), ['P'], '旧实现这里会变 [P(legacy)]')
+  const files = err?.extra?.files
+  assert.ok(Array.isArray(files) && files.includes('P.pdf') && files.includes('P.txt'), `extra.files 未点名残留：${JSON.stringify(err?.extra)}`)
+})
+await probe('R6-mixed-rename-rejected', async () => {
+  const { data } = mkLib()
+  mixedPaper(data)
+  const ap = fakeApproval()
+  const { tool } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  const err = await catchErr(() => tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'R' }, execOf()))
+  assert.equal(codeOf(err), 'layout-conflict', `错误码 ${codeOf(err)}`)
+  assert.deepEqual(snap(data), before)
+  assert.equal(ap.requests.length, 0)
+  assert.deepEqual(namesOf(data), ['P'])
+})
+await probe('R7-mixed-move-rejected', async () => {
+  const { data } = mkLib()
+  mixedPaper(data)
+  mkdirSync(join(data, 'S'), { recursive: true })
+  const ap = fakeApproval()
+  const { tool } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  const err = await catchErr(() => tool.execute({ action: 'move_paper', topic: 'T', name: 'P', to_topic: 'S' }, execOf()))
+  assert.equal(codeOf(err), 'layout-conflict', `错误码 ${codeOf(err)}`)
+  assert.deepEqual(snap(data), before)
+  assert.equal(ap.requests.length, 0)
+  assert.deepEqual(namesOf(data), ['P'], '旧实现这里会 [S/P, T/P(legacy)]')
+})
+
+// R8 修复不能伤到纯旧布局 / 纯新布局（对照组）：legacy 删除/改名仍可、move 仍 legacy-layout；folder 删除 dirRemoved=true。
+await probe('R8-pure-layout-controls', async () => {
+  // 纯旧布局：delete 把平铺产物移入回收站
+  {
+    const { data } = mkLib()
+    mkdirSync(join(data, 'T'), { recursive: true })
+    writeFileSync(join(data, 'T', 'P.pdf'), PDF('legacy'))
+    writeFileSync(join(data, 'T', 'P.txt'), 'cache')
+    const { tool } = makeTools(data, { approval: fakeApproval().service, scanner: async () => [] })
+    const out = await tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf())
+    assert.equal(out.ok, true)
+    assert.deepEqual(namesOf(data), [])
+  }
+  // 纯旧布局：rename 仍逐个文件改名
+  {
+    const { data } = mkLib()
+    mkdirSync(join(data, 'T'), { recursive: true })
+    writeFileSync(join(data, 'T', 'P.pdf'), PDF('legacy'))
+    writeFileSync(join(data, 'T', 'P.txt'), 'cache')
+    const { tool } = makeTools(data, { approval: fakeApproval().service, scanner: async () => [] })
+    const out = await tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'R' }, execOf())
+    assert.equal(out.new_name, 'R')
+    assert.deepEqual(namesOf(data), ['R(legacy)'])
+  }
+  // 纯旧布局：move 仍被红线拒绝
+  {
+    const { data } = mkLib()
+    mkdirSync(join(data, 'T'), { recursive: true })
+    mkdirSync(join(data, 'S'), { recursive: true })
+    writeFileSync(join(data, 'T', 'P.pdf'), PDF('legacy'))
+    const { tool } = makeTools(data, { approval: fakeApproval().service, scanner: async () => [] })
+    const err = await catchErr(() => tool.execute({ action: 'move_paper', topic: 'T', name: 'P', to_topic: 'S' }, execOf()))
+    assert.equal(codeOf(err), 'legacy-layout')
+  }
+  // 纯新布局：delete 仍成功且 dirRemoved=true
+  {
+    const { data } = mkLib()
+    newPaper(data, 'T', 'P')
+    const { tool } = makeTools(data, { approval: fakeApproval().service, scanner: async () => [] })
+    const out = await tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf())
+    assert.equal(out.dirRemoved, true, `dirRemoved=${out.dirRemoved}`)
+  }
+})
+
+// R9 F3：move 的 otherEntries / delete 的 dirRemoved 必须如实进入输出与摘要。
+await probe('R9-residue-truthfulness', async () => {
+  {
+    const { data } = mkLib()
+    const dir = newPaper(data, 'T', 'P')
+    writeFileSync(join(dir, 'notes.md'), 'user notes')
+    mkdirSync(join(dir, 'fig'), { recursive: true })
+    writeFileSync(join(dir, 'fig', 'a.png'), 'png')
+    mkdirSync(join(data, 'S'), { recursive: true })
+    const { tool } = makeTools(data, { approval: fakeApproval().service, scanner: async () => [] })
+    const out = await tool.execute({ action: 'move_paper', topic: 'T', name: 'P', to_topic: 'S' }, execOf())
+    assert.deepEqual([...(out.otherEntries ?? [])].sort(), ['fig', 'notes.md'], `otherEntries=${JSON.stringify(out.otherEntries)}`)
+    assert.match(out.summary, /notes\.md/)
+    assert.match(out.summary, /fig/)
+  }
+  {
+    const { data } = mkLib()
+    const dir = newPaper(data, 'T', 'P')
+    writeFileSync(join(dir, 'notes.md'), 'user notes')
+    const { tool } = makeTools(data, { approval: fakeApproval().service, scanner: async () => [] })
+    const out = await tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf())
+    assert.equal(out.dirRemoved, false, `dirRemoved=${out.dirRemoved}`)
+    assert.match(out.summary, /未删净/)
+    assert.ok(existsSync(join(dir, 'notes.md')))
+  }
+})
+
+// R10 F4：ctx.get 抛错 → 带机器码的 approval-unavailable（503），零副作用。
+await probe('R10-approval-resolver-throw-coded', async () => {
+  const { data } = mkLib()
+  newPaper(data, 'T', 'P')
+  const g = createLibraryGuards(data)
+  g.setPaperSessionScanner(async () => [])
+  const tools = {}
+  registerTools({ tools: { register: (x) => { tools[x.name] = x } }, get: () => { throw new Error('resolver exploded') } }, { dataDir: data }, g)
+  const before = snap(data)
+  const err = await catchErr(() => tools.library_manage.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf()))
+  assert.ok(err instanceof ManageError, `必须是 ManageError，实际 ${err?.name}: ${err?.message}`)
+  assert.equal(err.code, 'approval-unavailable', `code=${err.code}`)
+  assert.equal(err.status, 503)
+  assert.match(err.message, /^\[library_manage:approval-unavailable\]/)
+  assert.deepEqual(snap(data), before)
+})
+
+// R11 t3-low-1：create_topic 目标为同名普通文件 → 409 target-exists（不被覆盖）；真目录仍幂等；符号链接仍拒。
+await probe('R11-create-topic-target-kinds', async () => {
+  const { data } = mkLib()
+  writeFileSync(join(data, 'F'), 'i am a file')
+  const { tool } = makeTools(data, { approval: fakeApproval().service })
+  const before = snap(data)
+  const err = await catchErr(() => tool.execute({ action: 'create_topic', topic: 'F' }, execOf()))
+  assert.equal(codeOf(err), 'target-exists', `同名普通文件错误码 ${codeOf(err)}`)
+  assert.deepEqual(snap(data), before)
+  mkdirSync(join(data, 'D'), { recursive: true })
+  const ok = await tool.execute({ action: 'create_topic', topic: 'D' }, execOf())
+  assert.equal(ok.created, false, '已存在真目录必须幂等')
+  mkdirSync(join(data, 'Target'), { recursive: true })
+  symlinkSync(join(data, 'Target'), join(data, 'L'))
+  const before2 = snap(data)
+  const err2 = await catchErr(() => tool.execute({ action: 'create_topic', topic: 'L' }, execOf()))
+  assert.equal(codeOf(err2), 'escape-rejected', `符号链接专题错误码 ${codeOf(err2)}`)
+  assert.deepEqual(snap(data), before2)
+})
+
+// R12 修复自身的 TOCTOU：审批挂起期间把「混合态/目标占位」造出来，执行期必须重新预检。
+await probe('R12-fix-toctou-recheck', async () => {
+  // 12a delete：预检干净 → 审批挂起时造出平铺残留 → 执行期必须 layout-conflict
+  {
+    const { data } = mkLib()
+    newPaper(data, 'T', 'P')
+    const ap = fakeApproval()
+    let release
+    ap.state.gate = new Promise((r) => { release = r })
+    const { tool } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+    const p = tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf())
+    await new Promise((r) => setTimeout(r, 15))
+    assert.equal(ap.requests.length, 1)
+    writeFileSync(join(data, 'T', 'P.pdf'), PDF('flat-injected'))
+    release()
+    const err = await catchErr(() => p)
+    assert.equal(codeOf(err), 'layout-conflict', `12a 执行期未重新预检：${codeOf(err)}`)
+    assert.equal(existsSync(join(data, 'T', 'P', 'P.pdf')), true, '12a 论文夹被动了')
+    assert.equal(existsSync(join(data, '.trash')), false, '12a 产生了回收站残留')
+  }
+  // 12b move：同上，执行期必须 layout-conflict，且不得出现在目标专题
+  {
+    const { data } = mkLib()
+    newPaper(data, 'T', 'P')
+    mkdirSync(join(data, 'S'), { recursive: true })
+    const ap = fakeApproval()
+    let release
+    ap.state.gate = new Promise((r) => { release = r })
+    const { tool } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+    const p = tool.execute({ action: 'move_paper', topic: 'T', name: 'P', to_topic: 'S' }, execOf())
+    await new Promise((r) => setTimeout(r, 15))
+    writeFileSync(join(data, 'T', 'P.pdf'), PDF('flat-injected'))
+    release()
+    const err = await catchErr(() => p)
+    assert.equal(codeOf(err), 'layout-conflict', `12b 执行期未重新预检：${codeOf(err)}`)
+    assert.equal(existsSync(join(data, 'S', 'P')), false, '12b 目标出现论文夹（重复身份）')
+  }
+  // 12c rename：预检干净 → 审批挂起时造出目标平铺占位 → 执行期必须 target-exists
+  {
+    const { data } = mkLib()
+    newPaper(data, 'T', 'P')
+    const ap = fakeApproval()
+    let release
+    ap.state.gate = new Promise((r) => { release = r })
+    const { tool } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+    const p = tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'Q' }, execOf())
+    await new Promise((r) => setTimeout(r, 15))
+    writeFileSync(join(data, 'T', 'Q.pdf'), PDF('Q-injected'))
+    release()
+    const err = await catchErr(() => p)
+    assert.equal(codeOf(err), 'target-exists', `12c 执行期未重新预检：${codeOf(err)}`)
+    assert.equal(existsSync(join(data, 'T', 'P', 'P.pdf')), true, '12c 源论文夹被改名')
+    assert.equal(existsSync(join(data, 'T', 'Q', 'Q.pdf')), false, '12c 目标论文夹出现（遮蔽既有占位）')
+  }
+})
+
+// R13 混合态并发：3 个破坏性动作并发 → 全部 layout-conflict、零写盘、listPapers 稳定。
+await probe('R13-mixed-concurrent-rejects', async () => {
+  const { data } = mkLib()
+  mixedPaper(data)
+  mkdirSync(join(data, 'S'), { recursive: true })
+  const ap = fakeApproval()
+  const { tool } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  const rs = await Promise.allSettled([
+    tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf()),
+    tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'R' }, execOf()),
+    tool.execute({ action: 'move_paper', topic: 'T', name: 'P', to_topic: 'S' }, execOf()),
+  ])
+  const codes = rs.map((r) => (r.status === 'fulfilled' ? 'ok' : codeOf(r.reason)))
+  assert.deepEqual(codes, ['layout-conflict', 'layout-conflict', 'layout-conflict'], `并发错误码 ${codes}`)
+  assert.deepEqual(snap(data), before)
+  assert.equal(ap.requests.length, 0)
 })
 
 /* ═══════════════ 结果 ═══════════════ */
