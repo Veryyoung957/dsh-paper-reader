@@ -19,7 +19,7 @@
 
 ## 2. 新增用例与变异靶子（评审可独立复跑）
 
-新增 7 例（`test/library-manage-tools.test.mjs` G 组，总数 52 → 59）：
+新增 10 例（`test/library-manage-tools.test.mjs` G 组，总数 52 → 62）：
 
 | 用例 | 断言要点 |
 | --- | --- |
@@ -32,7 +32,7 @@
 | `G5[F4]` | `ctx.get` 抛错：抛 `ManageError{code:'approval-unavailable',status:503}`、消息带 `[library_manage:…]` 前缀与「未做任何改动」、快照不变、无 `.trash` |
 | `G6[t3-low-1]` | `create_topic` 目标为同名普通文件：409 `target-exists`、快照不变、文件不被覆盖；对照：已存在**目录**仍幂等 `created:false` |
 
-变异靶子（`test/mutation-probe.mjs`，LF 检出里 `--only LM2` 可跑）：
+变异靶子（`test/mutation-probe.mjs`；本工作树已是 LF 检出，可原地跑 `--only LM04` 单条或 `--only LM` 整组）：
 
 | id | 注入 | 判定用例 |
 | --- | --- | --- |
@@ -71,8 +71,11 @@
 1. **UI 文案未专门映射 `layout-conflict`**：`lib/client.js` 的 `errText` 无该分支，走 `err.message` 兜底（中文、可读）。本批 out of scope 不改 `lib/`；若要专门文案，需后续 UI 轮补一行 `case 'layout-conflict'`。
 2. **混合态的解决路径只提示「在界面完成迁移」**：工具不提供任何「合并/清理平铺残留」的能力（那等于替用户执行迁移，红线）。用户若不想迁移，只能在文件系统里自行处理。
 3. **`planTopicDelete`/`clearTopic` 未改动**：混合态论文会让专题「非空」而被拒；UI 的批量清空仍按既有逻辑只清论文夹那一半（既有语义，本轮不扩大改动面）。
-4. **UI 路由继承的加严未单独加用例**：本轮用例走工具层（`planRenamePaper`/`planPaperDelete` 同一实现）；UI 路由的行为由 `npm test` 的既有 634 例回归网兜底（数字：641 tests / 605 pass / 0 fail / 36 skipped）。
-5. **UI 的 `POST /api/library/topic` 仍返回 404**（同名普通文件）：本轮 inScope 不含 `src/host.ts`，只统一了 tool 侧 `create_topic` 的错误码；如要让界面也 409，需后续轮同步路由（1 行）。
+4. **UI 路由继承的加严未单独加用例**：本轮用例走工具层（`planRenamePaper`/`planPaperDelete` 同一实现）；UI 路由的行为由 `npm test` 的既有回归网兜底（全量 644 tests / 608 pass / 0 fail / 36 skipped，其中本套件 62 例 ⇒ 既有 582 例）。
+5. **`create_topic` 的 404 残留面（t7 R-F3，本轮明确不修）**：t6 只把「目标自身是同名普通文件」统一成 409 `target-exists`；以下两处**仍是 404 `not-found`**：
+   - tool 侧：**祖先段**是普通文件时（如 `create_topic('A/B')` 而 `A` 是一个文件），逐段复核走既有 `resolveTopicDir` ⇒ 404（未改，保持最小改动面）；
+   - UI 侧：`POST /api/library/topic` 路由完全未改（本轮 inScope 不含 `src/host.ts`），目标自身或祖先段是普通文件都仍 404。
+   如要统一成 409，需后续轮同时改 `resolveTopicDir` 的调用点与路由（各 1~2 行）；本轮不扩范围。
 6. **临时文件清理失败的可见性只到运行日志**：`console.warn` 不进入工具输出（不擅自扩 schema/summary 契约）；若将来要进 `summary`，需先更新 plan §1.5。
 7. **`test/reader-ux-verification.test.mjs` 的 VC1 白名单已按 t3 建议收窄**：`presets/` → `presets/paper-reader/agent\.cordis\.yml$`（只允许本轮 persona 文件）。实测非空转：临时造 `presets/paper-reader/evil-probe.yml` 时 VC1 变红并点名该文件；`agent.cordis.yml` 仍放行。
 8. t4 评审 §10 的其余残留（paper preset 审批 UI 真机可达性、`displayReason` 在 0.2.x 的展示、跨进程并发、`hasPdfMagic` 1KB 容忍、Windows/macOS 分支未实跑）本轮**未处理**，与 F1–F4 无关。
@@ -84,5 +87,6 @@ cd .worktrees/library-manage-tools
 npm run typecheck                                  # exit 0
 node --test test/library-manage-tools.test.mjs     # 62/62（A–G，0 skip）
 npm test                                           # 644 tests / 608 pass / 0 fail / 36 skipped
-node test/mutation-probe.mjs --only LM2            # LM20–LM25（LF 检出）：6/6 注入红 / 还原绿 / diff clean
+node test/mutation-probe.mjs --only LM04           # 单条：注入=红 / 还原=绿 / diff clean
+node test/mutation-probe.mjs --only LM             # 全组 25/25（LM01–LM25，含 LM21–LM25），无「锚点命中 0 次」
 ```

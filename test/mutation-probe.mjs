@@ -328,8 +328,10 @@ const MUTATIONS = [
     from: '    throw approvalError(lang, outcome as \'rejected\' | \'cancelled\' | \'unavailable\', action)', to: '    void 0',
     why: '拒绝态不抛错而是继续（B1 必红：拒绝当允许）' },
   { id: 'LM04-no-service-continues', file: 'src/tools.ts', needsBuild: true, testFile: 'test/library-manage-tools.test.mjs', pattern: 'B5',
-    from: '  const svc = typeof get === \'function\' ? (get.call(ctx, \'approval\') as ApprovalAsk | undefined) : undefined',
-    to: '  const svc = (typeof get === \'function\' ? (get.call(ctx, \'approval\') as ApprovalAsk | undefined) : undefined) ?? ({ request: async () => \'allowed-once\' } as ApprovalAsk)',
+    // t6 修 F4 后这一行被挪进 try 块（缩进 4 空格、去掉了 `const`）；锚点必须与**当前**逐字节一致，
+    // 否则 `锚点命中 0 次` ⇒ `--only LM` 24/25（t7 R-F1）。语义仍是「无审批服务时伪造总是允许的服务」。
+    from: '    svc = typeof get === \'function\' ? (get.call(ctx, \'approval\') as ApprovalAsk | undefined) : undefined',
+    to: '    svc = (typeof get === \'function\' ? (get.call(ctx, \'approval\') as ApprovalAsk | undefined) : undefined) ?? ({ request: async () => \'allowed-once\' } as ApprovalAsk)',
     why: '无审批服务时伪造一个「总是允许」的服务（B5 必红：fail open）' },
   { id: 'LM05-no-agent-check', file: 'src/tools.ts', needsBuild: true, testFile: 'test/library-manage-tools.test.mjs', pattern: 'B6',
     from: '  if (!exec?.agent) throw approvalError(lang, \'unavailable\', action)',
