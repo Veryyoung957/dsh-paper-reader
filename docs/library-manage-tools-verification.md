@@ -246,9 +246,11 @@ PASS rename_topic/allowed-once ok=true approval=allowed-once changed=true atRequ
 | 两个既有迁移工具行为未变 | 分支 vs 基线分别运行 `probe-migration.mjs`，再 `compare-migration.mjs` | `MIGRATION-TOOLS-IDENTICAL`：description、parameters、output.schema、report 全文、render 文本、choice 三态输出全部一致（仅归一化临时路径/时间戳/长 hex） |
 | 只读报告的尾句仍在 | `.probe/t3-verify/redline.txt` §9 / `src/tools.ts:1107` | `…执行入口：设置 → 论文伴读 → 查看论文状态…；我不会自动执行。` |
 
-`git status`：本报告落盘前工作树对 tracked 文件干净（`git diff HEAD` 为空）；中途曾出现另一个并发轮次
-留下的未跟踪目录 `docs/review/`（20:47 出现、稍后消失，含 `mutations.mjs`/`probes.mjs`，**不是本轮产物**），
-未触碰。
+`git status` 时间线（如实记录）：本报告落盘前工作树对 tracked 文件干净（`git diff HEAD` 为空）；
+中途曾出现另一个并发轮次留下的未跟踪目录 `docs/review/`（20:47 出现，含 `mutations.mjs`/`probes.mjs`，
+后由该轮次提交为 `0f09dde docs(review): t4 对抗评审…`）；20:51 起同一工作树出现**另一个会话的未提交
+修改**（`src/library-manage.ts`、`src/tools.ts`、`test/library-manage-tools.test.mjs`、
+`test/mutation-probe.mjs`，见 §10.2 第 4 条）。以上均**不是本轮产物**，本轮未触碰。
 
 ---
 
@@ -256,7 +258,8 @@ PASS rename_topic/allowed-once ok=true approval=allowed-once changed=true atRequ
 
 | 检出 | 提交 | tests | pass | fail | skipped | exit | 日志 |
 |---|---|---|---|---|---|---|---|
-| `.worktrees/library-manage-tools` | `af8d87d` | **634** | **598** | **0** | **36** | **0** | `.probe/t3-verify/branch-test.log` |
+| 工作树（验证开始时，`git status` 干净） | `af8d87d` | **634** | **598** | **0** | **36** | **0** | `.probe/t3-verify/branch-test.log` |
+| 新 clone `/tmp/af`（干净检出，权威数字） | `af8d87d` | **634** | **598** | **0** | **36** | **0** | `.probe/t3-verify/af8d87d-clean-test.log` |
 | 新 clone `/tmp/base` | `57309b2` | **582** | **546** | **0** | **36** | **0** | `.probe/t3-verify/baseline-test.log` |
 | 差值 | | +52 | +52 | 0 | 0 | | 新增 `test/library-manage-tools.test.mjs` 的 52 例 |
 
@@ -267,9 +270,15 @@ PASS rename_topic/allowed-once ok=true approval=allowed-once changed=true atRequ
   同一 `node_modules` 实测（不是采信旧报告）。
 - 分支日志有 4 处 `EROFS` 警告：测试环境里 `$DSH_HOME` 指向只读的真实 `~/.dsh` 时 preset 安装回退，
   不影响任何用例结果（preset 安装失败有显式回退）。基线同样行为。
-- 附注：第一次基线尝试用 `git archive` 解包到 `/tmp`（不是 git 仓库）导致 `VA11`/`VC1` 两条
+- 附注 1：第一次基线尝试用 `git archive` 解包到 `/tmp`（不是 git 仓库）导致 `VA11`/`VC1` 两条
   依赖 `git` 的用例误红（541 pass/2 fail）；换成真实 clone 后 **546 pass/0 fail**。此处如实记录，
   避免把「解包目录」当成有效基线。
+- 附注 2（并发污染，已规避）：本轮验证进行中，同一工作树出现了**另一个并发会话**的未提交修改
+  （`src/library-manage.ts`、`src/tools.ts`、`test/library-manage-tools.test.mjs`、
+  `test/mutation-probe.mjs`，mtime 20:51，内容是对 t4 评审 F2 等 finding 的修复，不是本轮产物）。
+  因此「`af8d87d` 的全量数字」以**干净 clone** 的复跑为准（上表第二行）；工作树那一行是在
+  `git status` 干净的时点跑的，数字一致。本轮**没有**在任何时点执行 `checkout/reset/stash`，
+  未触碰并发会话的改动。
 
 ---
 
@@ -282,7 +291,7 @@ PASS rename_topic/allowed-once ok=true approval=allowed-once changed=true atRequ
 | 穿越/符号链接/冲突/add/move 边界 ≥ 6 条独立用例，且非照抄实现方 | 自建夹具/断言 | §4，49 例 |
 | 红线核查有 grep 证据 | 无执行路径 + 两工具未变 | §6，`MIGRATION-TOOLS-IDENTICAL` |
 | 全量 npm test 数字如实记录并与基线对比（基线自测） | 分支 vs 基线各自实跑 | §7 |
-| 文档含复现命令/期望实际/环境限制；未改 src/test/lib | 本文件 + `git diff HEAD -- src test lib` 为空 | 满足 |
+| 文档含复现命令/期望实际/环境限制；未改 src/test/lib | 本文件；本轮只 `git add docs/library-manage-tools-verification.md` | 满足（工作树里另有并发会话的未提交 src/test 修改，见 §10.2 第 4 条与 §11） |
 
 ---
 
@@ -290,7 +299,7 @@ PASS rename_topic/allowed-once ok=true approval=allowed-once changed=true atRequ
 
 ### F1（低）`create_topic` 目标已存在且是普通文件时返回 404，而非 `target-exists 409`
 
-- 位置：`src/library-manage.ts:1321`（`if (existsSync(dir)) { resolveTopicDir(dataDir, topic) … }`）
+- 位置：`af8d87d` 的 `src/library-manage.ts:1321`（`if (existsSync(dir)) { resolveTopicDir(dataDir, topic) … }`）
   ——`existsSync` 对「文件」也为真，随后 `resolveTopicDir` 走 `lstat` 判定非目录 → `not-found`。
 - 复现（在本工作树内直接运行；构造 `data/A` 为普通文件后调用 `create_topic('A')`）：
 
@@ -319,7 +328,7 @@ PASS rename_topic/allowed-once ok=true approval=allowed-once changed=true atRequ
 
 ### F2（低）`addPaper` 成功路径上 `unlink(tmp)` 失败被静默吞掉，可能留下 `.tmp-*`
 
-- 位置：`src/library-manage.ts:1448`（`try { unlinkSync(tmpPath) } catch { /* 临时名残留：清理阶段兜底 */ }`）。
+- 位置：`af8d87d` 的 `src/library-manage.ts:1448`（`try { unlinkSync(tmpPath) } catch { /* 临时名残留：清理阶段兜底 */ }`）。
   该 catch 之后函数直接返回成功；外层清理只在**抛错**时运行，因此「link 成功、unlink 失败」会留下
   `<name>.pdf.tmp-<pid>-<8hex>`。该残留会被 `listArtifacts` 识别为 `tmp` 产物，之后删除/改名会把它一并处理，
   不属于孤儿，也不会覆盖数据。
@@ -362,7 +371,15 @@ PASS rename_topic/allowed-once ok=true approval=allowed-once changed=true atRequ
 2. 基线必须用**真实 git 检出**：`git archive` 解包目录不是 git 仓库，会让依赖 `git` 的既有用例
    （VC1/VA11）误红（见 §7 附注）。
 3. 测试环境里 `$DSH_HOME` 可能指向只读的 `~/.dsh`，preset 安装报 `EROFS` 并回退；与用例结果无关。
-4. 工作期间存在**并发轮次**在同一工作树活动（未跟踪 `docs/review/` 出现后消失）；本轮未触碰其内容。
+4. **并发轮次在同一工作树活动**（本轮**未触碰**其内容）：
+   - 20:47 出现未跟踪 `docs/review/`（t4 评审的自造探针/变异），后由该轮次提交为
+     `0f09dde docs(review): t4 对抗评审 library_manage…`；
+   - 20:51 起同一工作树出现**未提交**修改：`src/library-manage.ts`（+127/−…，新增
+     `layout-conflict`/`assertNoLayoutConflict`/`RenamePaperPlan` 等）、`src/tools.ts`、以及
+     `test/library-manage-tools.test.mjs`、`test/mutation-probe.mjs`（`git diff --stat` 合计
+     4 files, +376/−40，随该会话继续变化）。这不是 `af8d87d` 的内容，也不是本轮改动；
+   - 因此 `af8d87d` 的「全量回归」结论取自**干净 clone**（§7 第二行），不依赖工作树当前状态。
+     本报告落盘时工作树**不再**是「对 HEAD 干净」的状态，这一事实不应归因于 t3。
 5. `node_modules` 沿用方案 §0.2 的既有可用安装（复制自 `.worktrees/migrate-ui-report`），
    `package.json` 未改、未安装新依赖。
 
@@ -370,6 +387,11 @@ PASS rename_topic/allowed-once ok=true approval=allowed-once changed=true atRequ
 
 ## 11. 未修改声明
 
-- 本轮只新增 `docs/library-manage-tools-verification.md`；探针/日志在 gitignored 的 `.probe/t3-verify/`。
-- `git diff HEAD -- src test lib` 为空；未改 `dist/`（由 `npm test` 的 pretest 构建，gitignored）。
-- 未 push、未部署、未合并主分支。
+- 本轮只新增并提交 `docs/library-manage-tools-verification.md`（`git add` 只加了这一个文件）；
+  探针/日志在 gitignored 的 `.probe/t3-verify/`，未提交。
+- 本轮**没有**修改 `src/`、`test/`、`lib/`：`git show --stat c55c4d3` 只有本文件；本轮也没有执行
+  `checkout/reset/stash/restore`。
+- **落盘时工作树并非「对 HEAD 干净」**：`src/library-manage.ts`、`src/tools.ts`、
+  `test/library-manage-tools.test.mjs`、`test/mutation-probe.mjs` 有另一个并发会话的未提交修改
+  （见 §10.2 第 4 条）。这不是本轮产生的，本轮也没有把它们加入提交。
+- 未改 `dist/`（由 `npm test` 的 pretest 构建，gitignored）；未 push、未部署、未合并主分支。
