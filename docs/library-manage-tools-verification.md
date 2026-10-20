@@ -23,9 +23,12 @@
 | 5 | 全量 `npm test` 数字 + 基线自测对比 | **通过**：分支 `634 tests / 598 pass / 0 fail / 36 skipped`（exit 0）；基线（新 clone `57309b2`）`582 / 546 / 0 / 36`（exit 0）。差值 = 新增测试文件的 +52 例，全部 pass；skip 数不变 |
 | 6 | 文档含复现命令、期望/实际、环境限制；未改 src/test/lib | **通过**：见各节与 §10；`git diff HEAD -- src test lib` 为空 |
 
-另有 **2 条低风险事实**（不影响验收，见 §9）：`create_topic` 的目标路径若已存在且是**普通文件**时返回 404
-`not-found` 而非 409 `target-exists`；`addPaper` 成功路径上 `unlink(tmp)` 失败会被静默吞掉（代码审阅，
-未能复现）。二者都不产生越界写入或数据损失。
+另有 **2 条低风险事实**（见 §9 F1/F2）与 **1 条高优先级缺陷**（见 §9 F3）：
+`af8d87d` 在「论文夹 + 同 stem 平铺残留」的混合布局下，`delete_paper`/`rename_paper`/`move_paper`
+会**只处理论文夹那一半却返回 `ok:true`**（删除后文献仍在；改名/移动后同一篇出现两次）。
+该缺陷由 t4 评审（`0f09dde` 的 F2）先指出，本轮在**干净 clone 的 af8d87d** 上独立复现；
+本报告落盘时工作树里已有另一会话的**未提交**修复（`layout-conflict`/`assertNoLayoutConflict`），
+**本轮没有验证该修复**。正文 §9 F3 给了复现命令与期望/实际。
 
 ---
 
@@ -335,7 +338,34 @@ PASS rename_topic/allowed-once ok=true approval=allowed-once changed=true atRequ
 - 局限：`unlink` 失败需要故障注入或特殊文件系统；本轮**未能复现**，属代码审阅观察（`file:line` 如上）。
   若要关闭，建议在成功路径上把「清理临时名失败」降级为显式告警/或把残留写进返回值。
 
-### F3（提示，非缺陷）`test/reader-ux-verification.test.mjs` 白名单新增 `presets/` 的评估
+### F3（高，`af8d87d`）混合布局（论文夹 + 同 stem 平铺残留）下破坏性动作「半成功却报 ok」
+
+- 位置（`af8d87d`）：布局判定 `src/library-manage.ts:569`（`isLegacyPaper` → 文件夹赢）、
+  `planPaperDelete` `:556`、`deletePaper` `:606`、`renamePaper` `:1120`、`planMovePaper` `:1521`。
+  `listPapers` 的确定性优先级是「论文夹赢」，因此专题目录里同 stem 的平铺产物成了**不可见的第二身份**；
+  三个动作都只操作论文夹，平铺那半原样留下。
+- 复现（干净 clone `af8d87d` + `npm run build`，在库内构造混合态后调用工具；核心断言如下）：
+
+  ```bash
+  # 夹具：data/T/P/P.pdf（论文夹） + data/T/P.pdf、data/T/P.txt（同 stem 平铺残留）
+  # 然后分别调用 library_manage（scanner 注入空数组、approval 返回 allowed-once）
+  ```
+  ```text
+  before papers: ["T/P"]
+  [delete] ok= true moved= ["P.pdf"] after papers: ["T/P"]      T dir: ["P.pdf","P.txt"]
+  [rename] ok= true new_name= Q      after papers: ["T/P","T/Q"] T dir: ["P.pdf","P.txt","Q"]
+  [move]   ok= true to= S            after papers: ["S/P","T/P"] T dir: ["P.pdf","P.txt"]  S dir: ["P"]
+  ```
+- 期望：混合态是「迁移冲突后的真实形态」（方案 §3.2.5 的红线取向：迁移执行只留在界面）。
+  破坏性动作应**拒绝并提示先在界面完成迁移**（或对两半都做完整处理），而不是返回 `ok:true`
+  让用户看到「删了还在 / 一篇变两篇 / 移动后两处都有」。
+- 实际（`af8d87d`）：三种都 `ok:true`，数据出现在两个位置或删除不生效；无越界写入、无数据丢失，
+  但用户可见语义错误。**该缺陷已被 t4 评审 F2 指出**；本轮只做独立复现与事实记录，未验证工作树里
+  正在进行的修复（`layout-conflict` + `assertNoLayoutConflict`，未提交、非本轮产物）。
+- 对 t3 验收的影响：不在本轮 6 条 acceptance 的字面范围内（审批/回收站/边界/在途/红线/回归均通过），
+  但**集成前必须包含该修复**，并应新增「混合态 delete/rename/move」用例钉住。
+
+### F4（提示，非缺陷）`test/reader-ux-verification.test.mjs` 白名单新增 `presets/` 的评估
 
 - 事实：该守卫用 `git status --porcelain` 的 touched 路径逐个匹配白名单（`test/reader-ux-verification.test.mjs:1799-1808`）；
   本轮交付按方案 §1.7/附录 A 确实修改了 `presets/paper-reader/agent.cordis.yml`（persona 增加
