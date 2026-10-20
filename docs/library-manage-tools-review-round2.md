@@ -2,6 +2,9 @@
 
 - 评审对象：`feat/library-manage-tools` @ `89a1186`（t6 repair-round-2；父 `044b7b5`；基线上轮 `af8d87d`）
 - 上一轮：[docs/library-manage-tools-review.md](library-manage-tools-review.md)（t4，verdict=needs_revision，F1–F4）
+
+> **状态更新（t5 集成收尾，当前 tip `2f5e14f`）**：本轮的 R-F1（LM04 锚点）/R-F2（文档数字）已由
+> `2f5e14f` 修复，R-F3 按契约登记为残留；第三轮聚焦复审 **verdict=pass**（[review-round3](library-manage-tools-review-round3.md)）。
 - 修复记录：[docs/library-manage-tools-repair.md](library-manage-tools-repair.md)（t6，自述 —— 本报告**不采信**，全部重跑）
 - 方法与第一轮相同：自造探针（现 38 条）+ 自造变异（现 10 条）+ 沙箱副本里复跑实现方 LM01–LM25；不改被评审检出
 - 环境：Node v22.22.1；`@deepseek-ai/dsh-tools` 0.1.5-rc.2；`@deepseek-ai/dsh-user-approval` 0.1.5-rc.3

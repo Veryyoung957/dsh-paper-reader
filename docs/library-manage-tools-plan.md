@@ -4,6 +4,11 @@
 > 基线：`feat/migrate-prompt@57309b2`（已安装产品线）。工作树：`.worktrees/library-manage-tools`，分支 `feat/library-manage-tools`。
 > 纪律：**本文件只冻结契约，不改实现**；本轮只在 `docs/` 落盘并提交到分支，不 push、不合并、不部署、不碰 `~/.dsh`。
 > 读者：t2（实现）、t3（独立评审/验证）。**评审请直接照 §6 的变异靶子施工，不要采信本文件的结论**。
+>
+> **实现偏差登记（t5 集成收尾）**：本契约冻结于 `d37fe49`。实现/修复轮产生了 6 条**有据偏离**
+> （变体后缀保持大小写敏感、透传 `displayReason`、新增 `planMovePaper`/`planRenamePaper`、
+> rename 目标三路冲突、`layout-conflict` 混合态拒绝、`create_topic` 同名文件 409 等），
+> 逐条原因与「哪些既有语义未动」见 [library-manage-tools-repair.md](library-manage-tools-repair.md) §3。
 
 ---
 

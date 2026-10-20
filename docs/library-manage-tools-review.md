@@ -1,6 +1,10 @@
 # t4 对抗评审：agent 文献整理工具 `library_manage`
 
 - 评审对象：`feat/library-manage-tools` @ `af8d87d`（父 `d37fe49`，基线 `57309b2`）
+
+> **状态更新（t5 集成收尾，当前 tip `2f5e14f`）**：本报告的 verdict=needs_revision 针对 `af8d87d`；
+> F1–F4 已由 `89a1186` 修复并经第二轮复核（[review-round2](library-manage-tools-review-round2.md)），
+> 其 R-F1/R-F2 由 `2f5e14f` 修复后第三轮给出 **verdict=pass**（[review-round3](library-manage-tools-review-round3.md)）。
 - 冻结契约：[docs/library-manage-tools-plan.md](library-manage-tools-plan.md)
 - 评审方式：**不复用实现方 `test/` 的断言做结论**；自造 25 条对抗探针 + 5 条自造变异 + 在沙箱副本里复跑实现方 LM01–LM20
 - 环境：Node v22.22.1；`@deepseek-ai/dsh-tools` 0.1.5-rc.2（devDep）；`@deepseek-ai/dsh-user-approval` 0.1.5-rc.3（传递安装，审批 API 以此为准）

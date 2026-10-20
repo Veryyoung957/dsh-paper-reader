@@ -5,6 +5,11 @@
 > `af8d87d`（父 `d37fe49` 契约文档；基线 `57309b2` = `feat/migrate-prompt`）。本报告单独以
 > 一个 `docs:` 提交落盘（只含本文件，不改代码）。
 > 冻结契约：[`docs/library-manage-tools-plan.md`](library-manage-tools-plan.md)（下称「方案」）。
+>
+> **状态更新（t5 集成收尾，当前 tip `2f5e14f`）**：本报告的被测实现是 `af8d87d`；§9 F3（混合布局
+> 「半成功却报 ok」）已由 `89a1186` 修复（`layout-conflict` + rename 三路目标冲突），§9 F1/F2 两条低危
+> 同轮修复；最终复审 verdict=pass 见 [review-round3](library-manage-tools-review-round3.md)。当前全量
+> 数字为 **644 tests / 608 pass / 0 fail / 36 skipped**（本报告 §0 的 634/598 是 `af8d87d` 时点的数字）。
 > 纪律：**不采信实现方自述与它自己的测试结论**。本报告的每条结论都来自本轮新建的夹具与探针；
 > 探针脚本放在工作树内被 `.gitignore` 忽略的 `.probe/t3-verify/`（不提交，见 §10 环境限制），
 > 全部只 import 分支构建产物 `dist/*.js`，不 import `test/` 下的任何断言。
