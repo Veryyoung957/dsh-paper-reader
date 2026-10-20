@@ -76,6 +76,16 @@ dsh plugin --profile web add @ggboy123/dsh-paper-reader@latest   # 升级也是�
 
 - 删除 = **移入回收站** `data/.trash/`（带 manifest，移回即恢复）；会处理该文献的全部产物：`<文献>.pdf`、`.txt`、`.pages.json`、`.transcript.json`、`.mineru.md`、`.mineru.json`、`.embeddings.json`、`.study.json` 与译文变体 `<文献>-en.pdf` / `-zh.pdf` / `-dual.pdf`（含 `.tmp-*` 残留）；伴读会话历史不删。运行中会话/翻译中的文献会被前置拒绝；路径穿越一律拒绝、失败自动回滚——细则见 [docs/features.md](docs/features.md)
 
+## 对话侧文献整理
+
+在「论文伴读」会话里可以直接让 agent 整理文献：新建专题、把本地 PDF 收进库、给论文/专题改名、跨专题移动论文、删除论文或空专题（进回收站可恢复）。工具面是单一的 `library_manage`，七个动作：`create_topic` / `add_paper` / `move_paper` / `rename_paper` / `rename_topic` / `delete_paper` / `delete_topic`。
+
+- **删除、改名、跨专题移动会弹出 DSH 审批卡**：只有你在卡片上点「允许」的那一次才会执行。拒绝、取消、审批通道不可用（例如没有可交互会话）时**一个字节都不会动**，也不会退化成「模型自己确认」——参数里根本没有 confirm/token 这类字段，你在正文里回一句「确认」也不构成授权
+- **收录（add_paper）只读源文件**：不移动、不删除、不覆盖已有文献；要求是常规 PDF（非符号链接）、非空、带 `%PDF-` 头。落盘失败自动清理到零改动
+- **删除同样进回收站**：与界面删除共用同一套回收站、伴读会话/翻译在途前置检查与在途互斥锁；回收站里带 manifest，按相对路径移回即恢复
+- **非空专题只能逐篇删除**（每篇各自审批），批量清空仍只留在界面的文献库操作里
+- **旧布局（平铺）的文献不允许被工具移动**：迁移执行仍然只能在「设置 → 论文伴读 → 查看论文状态」由你确认
+
 ## 参与开发
 
 ```bash

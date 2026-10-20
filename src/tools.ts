@@ -2,7 +2,8 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { listPapers, listTopics, resolveDataDir, resolvePaper, type PaperRef } from './library.ts'
+import { basename } from 'node:path'
+import { listPapers, listTopics, paperRefFor, resolveDataDir, resolvePaper, type PaperRef } from './library.ts'
 import { transcribePaper, readTranscript, type SourceArg } from './transcribe.ts'
 import { chunkText, queryVariantsFor, searchChunksMulti, formatHits } from './search.ts'
 import { readTranscriptMeta } from './transcribe.ts'
@@ -14,7 +15,28 @@ import { readerOrigin } from './origin.ts'
 import { resolveMineruConfig, type MineruConfig } from './mineru-config.ts'
 import { formatMigrationReport, planMigration } from './migrate.ts'
 import {
+  ManageError,
+  addPaper,
+  createTopic,
+  deletePaper,
+  deleteTopic,
+  isManageError,
+  movePaper,
+  planMovePaper,
+  planPaperDelete,
+  planTopicDelete,
+  renamePaper,
+  renameTopic,
+  validateEntryBoundary,
+  validatePaperName,
+  validateTopicPath,
+  type ManageCode,
+} from './library-manage.ts'
+import { createLibraryGuards, type LibraryGuards } from './library-guards.ts'
+import { zhStatus } from './translate.ts'
+import {
   detectMigrationNeed,
+  invalidateMigrationPromptCache,
   promptStatePayload,
   resetPromptState,
   takeMigrationPrompt,
@@ -224,8 +246,340 @@ function producerLabel(producer: string): string {
   }
 }
 
-export function registerTools(ctx: Context, config: PluginConfig) {
+/* ═══════════════════════════════════════════════════════════════════════════
+   agent 侧「文献整理」工具（冻结契约：docs/library-manage-tools-plan.md）
+
+   · 单一 `library_manage` + 7 个 action（建专题 / 收录 / 移动 / 改名 ×2 / 删除 ×2）；
+   · 破坏性动作（delete_paper / delete_topic / rename_paper / rename_topic / move_paper）在执行前
+     **必须**经 DSH 用户审批（`ctx.approval.request`）拿到 `allowed-once`：其余三态
+     （rejected / cancelled / unavailable）一律**零副作用**并返回明确的机器码；
+   · 参数里**没有** confirm / confirmName / token / approve 之类的「模型自填确认」——
+     用户只能在审批 UI 上点允许，模型在正文里问一句不算确认（§2.7 红线）；
+   · 迁移执行**不在**本工具内：action 枚举没有 migrate/rollback/clear_topic，也不 import 迁移执行函数
+     （执行入口只在界面，docs/migrate-prompt-plan.md 红线）。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const MANAGE_ACTIONS = ['create_topic', 'add_paper', 'move_paper', 'rename_paper', 'rename_topic', 'delete_paper', 'delete_topic'] as const
+type ManageAction = (typeof MANAGE_ACTIONS)[number]
+type ManageLang = 'zh' | 'en'
+type ManageField = 'topic' | 'name' | 'new_name' | 'to_topic' | 'source_path'
+
+/** action 级必填（§1.4）：未标 required 的字段一律可选，缺失在 execute 内自查（DSL 只能声明顶层 required）。 */
+const MANAGE_REQUIRED: Record<ManageAction, readonly ManageField[]> = {
+  create_topic: ['topic'],
+  add_paper: ['topic', 'source_path'],
+  move_paper: ['topic', 'name', 'to_topic'],
+  rename_paper: ['topic', 'name', 'new_name'],
+  rename_topic: ['topic', 'new_name'],
+  delete_paper: ['topic', 'name'],
+  delete_topic: ['topic'],
+}
+
+/** 需要用户逐次审批的动作（§2.2）：改/移既有身份或让数据离开可检索位置。 */
+const MANAGE_NEEDS_APPROVAL: Record<ManageAction, boolean> = {
+  create_topic: false,
+  add_paper: false,
+  move_paper: true,
+  rename_paper: true,
+  rename_topic: true,
+  delete_paper: true,
+  delete_topic: true,
+}
+
+const ACTION_LABEL: Record<ManageAction, { zh: string; en: string }> = {
+  create_topic: { zh: '创建专题', en: 'create a topic' },
+  add_paper: { zh: '收录 PDF', en: 'add a PDF' },
+  move_paper: { zh: '移动论文', en: 'move a paper' },
+  rename_paper: { zh: '重命名论文', en: 'rename a paper' },
+  rename_topic: { zh: '重命名专题', en: 'rename a topic' },
+  delete_paper: { zh: '删除论文', en: 'delete a paper' },
+  delete_topic: { zh: '删除专题', en: 'delete a topic' },
+}
+
+/** en 模式下给既有中文 ManageError 追加的英文要点（§4.1：不谎称已本地化，只补一句映射）。 */
+const EN_CODE_HINT: Partial<Record<ManageCode, string>> = {
+  'bad-name': 'Invalid name',
+  'bad-request': 'Bad request',
+  'not-found': 'Topic/paper not found',
+  'escape-rejected': 'Path escape rejected',
+  'target-exists': 'Target already exists',
+  'topic-not-empty': 'Topic not empty',
+  'session-unknown': 'Session state unknown',
+  'session-running': 'Running reader sessions',
+  'translation-busy': 'Translation in progress',
+  busy: 'Another operation in progress',
+  'file-busy': 'File is busy',
+  'trash-move-failed': 'Trash move failed',
+  'rename-partial': 'Rename partially failed',
+  'legacy-layout': 'Legacy layout; migrate in UI first',
+  'source-not-found': 'Source not found',
+  'source-invalid': 'Source must be a regular file',
+  'source-empty': 'Source is empty',
+  'source-not-pdf': 'Source is not a PDF',
+  'add-partial': 'Add failed (cleaned up / residue listed)',
+  'move-partial': 'Move failed; rollback result',
+  'approval-rejected': 'The user rejected this action; nothing changed',
+  'approval-cancelled': 'Approval cancelled; nothing changed',
+  'approval-unavailable': 'Approval channel unavailable; nothing changed',
+}
+
+/** 文案语言（每次调用现读）：DPR_LIBRARY_MANAGE_LANG=en → en，其余 zh（沿用库内先例 promptLang）。 */
+function manageLang(): ManageLang {
+  return process.env['DPR_LIBRARY_MANAGE_LANG']?.trim() === 'en' ? 'en' : 'zh'
+}
+
+/** 工具自己生成的错误：统一 `[library_manage:<code>] ` 前缀（§4.1）。 */
+function toolErr(
+  code: ManageCode,
+  status: number,
+  zhText: string,
+  enText: string,
+  lang: ManageLang,
+  extra: Record<string, unknown> = {},
+): ManageError {
+  return new ManageError(code, status, `[library_manage:${code}] ${lang === 'zh' ? zhText : enText}`, extra)
+}
+
+/** 把 dataDir 绝对路径从错误文案里剥掉（S15/F5：错误响应只允许相对 trashRel）。 */
+function sanitizeManageError(dataDir: string, err: ManageError): ManageError {
+  const message = dataDir ? err.message.split(dataDir).join('<dataDir>') : err.message
+  if (message === err.message) return err
+  return new ManageError(err.code, err.status, message, err.extra)
+}
+
+/** 给库层抛出的 ManageError 加工具前缀（en 模式再补一句英文要点），并脱敏绝对路径。 */
+function withToolPrefix(lang: ManageLang, dataDir: string, err: ManageError): ManageError {
+  const prefix = `[library_manage:${err.code}] `
+  if (err.message.startsWith(prefix)) return sanitizeManageError(dataDir, err)
+  const hint = lang === 'en' ? ` (en: ${EN_CODE_HINT[err.code] ?? err.code})` : ''
+  return sanitizeManageError(dataDir, new ManageError(err.code, err.status, prefix + err.message + hint, err.extra))
+}
+
+function normalizeManageAction(raw: unknown, lang: ManageLang): ManageAction {
+  if (typeof raw === 'string' && (MANAGE_ACTIONS as readonly string[]).includes(raw)) return raw as ManageAction
+  throw toolErr('bad-request', 400,
+    `action 必须是 ${MANAGE_ACTIONS.join(' / ')} 之一（迁移执行不在本工具内）`,
+    `action must be one of ${MANAGE_ACTIONS.join(' / ')} (migration execution is not exposed here)`,
+    lang)
+}
+
+function requireManageFields(action: ManageAction, args: Record<string, unknown>, lang: ManageLang): void {
+  for (const f of MANAGE_REQUIRED[action]) {
+    const v = args[f]
+    if (typeof v !== 'string' || v.trim() === '') {
+      throw toolErr('bad-request', 400,
+        `${action} 缺少必填参数 ${f}（字符串）`,
+        `${action} requires the ${f} parameter (string)`,
+        lang)
+    }
+  }
+}
+
+interface ManageSummaryInput {
+  action: ManageAction
+  topic: string
+  name?: string
+  newName?: string
+  toTopic?: string
+  created?: boolean
+  bytes?: number
+  fileCount?: number
+  totalBytes?: number
+  trashRel?: string | null
+  detached?: number
+  sourceName?: string
+  hiddenCount?: number
+}
+
+/** summary / render 同源（§1.5）：zh 默认，DPR_LIBRARY_MANAGE_LANG=en 切 en。 */
+function formatSummary(lang: ManageLang, s: ManageSummaryInput): string {
+  const zh = lang === 'zh'
+  switch (s.action) {
+    case 'create_topic':
+      if (s.created) {
+        return zh
+          ? `已创建专题：${s.topic}（空专题；可用 add_paper 收录 PDF）`
+          : `Topic created: ${s.topic} (empty; use add_paper to add PDFs)`
+      }
+      return zh ? `专题已存在：${s.topic}（未做任何改动）` : `Topic already exists: ${s.topic} (nothing changed)`
+    case 'add_paper':
+      return zh
+        ? `已收录《${s.topic}/${s.name}》：${s.bytes} 字节，源文件 ${s.sourceName} 未被移动或删除`
+        : `Added ${s.topic}/${s.name}: ${s.bytes} bytes; source ${s.sourceName} left untouched`
+    case 'move_paper':
+      return zh
+        ? `已移动《${s.topic}/${s.name}》→《${s.toTopic}/${s.name}》：${s.fileCount} 个产物随论文文件夹整体移动，内容未改；${s.detached} 个伴读会话不再自动挂到新路径`
+        : `Moved ${s.topic}/${s.name} → ${s.toTopic}/${s.name}: ${s.fileCount} artifacts moved with the paper folder, contents unchanged; ${s.detached} reader sessions no longer bind to the new path`
+    case 'rename_paper':
+      return zh
+        ? `已重命名《${s.topic}/${s.name}》→《${s.topic}/${s.newName}》：${s.fileCount} 个文件同步改名；${s.detached} 个伴读会话不再自动挂到新路径`
+        : `Renamed ${s.topic}/${s.name} → ${s.topic}/${s.newName}: ${s.fileCount} files renamed; ${s.detached} reader sessions no longer bind to the new path`
+    case 'rename_topic':
+      return zh
+        ? `已重命名专题《${s.topic}》→《${s.newName}》：目录整体移动；${s.detached} 个伴读会话不再自动挂到新路径`
+        : `Renamed topic ${s.topic} → ${s.newName}: directory moved; ${s.detached} reader sessions no longer bind to the new path`
+    case 'delete_paper':
+      return zh
+        ? `已删除《${s.topic}/${s.name}》→ 回收站 ${s.trashRel}（${s.fileCount} 个文件，${s.totalBytes} 字节；按相对路径可手工移回恢复）`
+        : `Deleted ${s.topic}/${s.name} → trash ${s.trashRel} (${s.fileCount} files, ${s.totalBytes} bytes; recover manually by moving them back)`
+    case 'delete_topic':
+      if (s.trashRel) {
+        return zh
+          ? `已删除空专题《${s.topic}》→ 回收站 ${s.trashRel}（隐藏条目已移入，可恢复）`
+          : `Deleted empty topic ${s.topic} → trash ${s.trashRel} (hidden entries preserved)`
+      }
+      return zh
+        ? `已删除空专题《${s.topic}》（无隐藏条目，未创建回收站目录）`
+        : `Deleted empty topic ${s.topic} (no hidden entries; no trash bundle created)`
+    default: {
+      const never: never = s.action
+      throw new Error(`未知 action: ${String(never)}`)
+    }
+  }
+}
+
+/* ── 审批门（§2）：只认 allowed-once；无服务/无 agent/无 answerer 一律 fail closed ────────── */
+
+type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
+const APPROVAL_OUTCOMES = ['allowed-once', 'rejected', 'cancelled', 'unavailable'] as const
+
+/**
+ * 本地**结构化**类型（不 import @deepseek-ai/dsh-user-approval、不新增依赖、不改 inject）：
+ * 与官方 dsh-sandbox 的 minimal structural shape 同一取向；`ctx.get('approval')` 运行时可选读取。
+ * `displayReason` 只在 0.2.x 的 ApprovalRequestEvent 上存在（本插件 devDep 0.1.5 类型没有它），
+ * 这里作为可选字段透传：新版审批 UI 拿得到，旧版忽略，不靠它做任何判断。
+ */
+interface ApprovalRequestLike {
+  agent: unknown
+  toolName: string
+  callId?: unknown
+  reason: string
+  displayReason?: string
+  signal?: AbortSignal
+}
+interface ApprovalAsk {
+  request(req: ApprovalRequestLike): Promise<ApprovalOutcome>
+}
+
+function approvalError(
+  lang: ManageLang,
+  kind: 'rejected' | 'cancelled' | 'unavailable',
+  action: ManageAction,
+): ManageError {
+  const label = ACTION_LABEL[action]
+  const code: ManageCode = kind === 'rejected' ? 'approval-rejected' : kind === 'cancelled' ? 'approval-cancelled' : 'approval-unavailable'
+  const status = kind === 'rejected' ? 403 : kind === 'cancelled' ? 409 : 503
+  const zhText = kind === 'rejected'
+    ? `用户拒绝了本次${label.zh}；未做任何改动。请如实告知用户，不要重试或绕过。`
+    : kind === 'cancelled'
+      ? '审批被取消；未做任何改动。'
+      : '审批通道不可用（无审批服务 / 无 agent / 无 answerer），已拒绝执行；未做任何改动。'
+  const enText = kind === 'rejected'
+    ? `The user rejected this ${label.en}; nothing changed. Tell the user honestly; do not retry or bypass the approval.`
+    : kind === 'cancelled'
+      ? 'Approval cancelled; nothing changed.'
+      : 'Approval channel unavailable (no approval service / no agent / no answerer); nothing changed.'
+  return toolErr(code, status, zhText, enText, lang)
+}
+
+function signalAborted(exec: { signal?: AbortSignal } | undefined): boolean {
+  return exec?.signal?.aborted === true
+}
+
+/**
+ * 审批（§2.3 冻结顺序）：已取消 → 不打扰；无服务/无 agent → 拒绝；request 抛错或闭集外的值 →
+ * 按「通道不可用」拒绝；只有 `allowed-once` 才继续。**绝不**「先做后问」。
+ */
+async function requestManageApproval(opts: {
+  ctx: Context
+  exec: { agent?: unknown; callId?: unknown; signal?: AbortSignal } | undefined
+  lang: ManageLang
+  action: ManageAction
+  reason: string
+}): Promise<void> {
+  const { ctx, exec, lang, action, reason } = opts
+  // 只允许「需要审批」的动作走到这里（§2.2 的表格是唯一事实源；将来新增动作忘了分档会在这里炸）
+  if (!MANAGE_NEEDS_APPROVAL[action]) {
+    throw toolErr('bad-request', 400,
+      `${action} 不需要审批，不应调用审批门（实现错误）`,
+      `${action} does not require approval; the approval gate must not be called (implementation bug)`,
+      lang)
+  }
+  if (signalAborted(exec)) throw approvalError(lang, 'cancelled', action)
+  const get = (ctx as unknown as { get?: (name: string) => unknown }).get
+  const svc = typeof get === 'function' ? (get.call(ctx, 'approval') as ApprovalAsk | undefined) : undefined
+  if (!svc || typeof svc.request !== 'function') throw approvalError(lang, 'unavailable', action)
+  if (!exec?.agent) throw approvalError(lang, 'unavailable', action)
+  let outcome: unknown
+  try {
+    outcome = await svc.request({
+      agent: exec.agent,
+      toolName: 'library_manage',
+      ...(exec.callId !== undefined ? { callId: exec.callId } : {}),
+      reason,
+      displayReason: reason,
+      ...(exec.signal ? { signal: exec.signal } : {}),
+    })
+  } catch {
+    // 无 open turn / 审计写失败 / answerer 抛错 ⇒ 通道不可用（绝不当成允许）
+    throw approvalError(lang, 'unavailable', action)
+  }
+  if (typeof outcome !== 'string' || !(APPROVAL_OUTCOMES as readonly string[]).includes(outcome)) {
+    throw approvalError(lang, 'unavailable', action)
+  }
+  if (outcome !== 'allowed-once') {
+    throw approvalError(lang, outcome as 'rejected' | 'cancelled' | 'unavailable', action)
+  }
+  // 批准之后、第一次写盘之前再查一次取消（取消 = 零副作用）
+  if (signalAborted(exec)) throw approvalError(lang, 'cancelled', action)
+}
+
+/** 审批 reason：双语单串（§2.4），审批弹窗由用户看，不随 DPR_LIBRARY_MANAGE_LANG 变。 */
+function approvalReason(
+  action: ManageAction,
+  d: { topic: string; name?: string; newName?: string; toTopic?: string; fileCount?: number; totalBytes?: number; hiddenCount?: number },
+): string {
+  const target = d.name ? `${d.topic}/${d.name}` : d.topic
+  let detail: string
+  switch (action) {
+    case 'delete_paper':
+      detail = `${d.fileCount ?? 0} 个文件（${d.totalBytes ?? 0} 字节）→ 回收站 .trash`
+      break
+    case 'delete_topic':
+      detail = `空专题；${d.hiddenCount ?? 0} 个隐藏条目 → 回收站`
+      break
+    case 'rename_paper':
+      detail = `${d.name} → ${d.newName}（${d.fileCount ?? 0} 个文件同步改名）`
+      break
+    case 'rename_topic':
+      detail = `${d.topic} → ${d.newName}（整棵子树）`
+      break
+    case 'move_paper':
+      detail = `${d.topic} → ${d.toTopic}（论文文件夹整体移动）`
+      break
+    default:
+      detail = ''
+  }
+  return `【文献整理 / Library manage】${action}：《${target}》${detail}。仅本次调用有效 / one-shot；`
+    + '未获批准不会改动任何文件。 / Nothing changes unless you allow this one call.'
+}
+
+/** 翻译在途前置（沿用 host 的 zhStatus 口径：正在生成译文就拒绝，避免改/移正在写的产物）。 */
+function assertTranslationIdle(lang: ManageLang, refs: PaperRef[]): void {
+  for (const ref of refs) {
+    if (!zhStatus(ref).busy) continue
+    throw toolErr('translation-busy', 409,
+      '该文献（或该专题内某篇文献）正在生成译文，请等待完成后再操作',
+      'A paper in scope is generating a translation; retry after it finishes',
+      lang)
+  }
+}
+
+export function registerTools(ctx: Context, config: PluginConfig, guards?: LibraryGuards) {
   const dataDir = resolveDataDir(config.dataDir)
+  // 破坏性操作的共用前置（会话准入 / 在途锁 / 缓存钩子）：与 host 路由**共用同一个实例**
+  // （src/index.ts 显式创建并双传）。第三参缺省时自建一个，只服务既有测试（不传 = 不共享）。
+  const g = guards ?? createLibraryGuards(dataDir)
   const shortlistSize = resolveShortlistSize(config.typesafe)
 
   ctx.tools.register(defineTool({
@@ -835,4 +1189,294 @@ export function registerTools(ctx: Context, config: PluginConfig) {
       }
     },
   }))
+
+  /* ── 文献整理（agent 侧写操作；破坏性动作逐次经 DSH 用户审批）─────────────────────────
+     契约：docs/library-manage-tools-plan.md §1（工具面）/§2（审批门）/§3（复用）/§4（拒绝码）。
+     · 校验顺序**冻结**：参数 → 词法 → 存在性/冲突（只读）→ 在途锁 → 会话/翻译 → 审批 → 执行；
+     · 写动作**不复用** locate() 的「按会话反解当前论文」回退：审批 reason 必须指名道姓，
+       模型省略参数时由服务端猜目标违背最小惊讶（§1.6）。
+     · 迁移执行不在本工具内（红线）：action 枚举没有 migrate*，也不 import 迁移执行函数。 */
+  const libraryManageTool = defineTool({
+    name: 'library_manage',
+    description:
+      '整理文献库。action 必填：create_topic=新建专题；add_paper=把本地 PDF 收进专题；' +
+      'move_paper=把一篇论文移到另一个专题；rename_paper=改论文名；rename_topic=改专题名/移动专题；' +
+      'delete_paper=删除论文（移入回收站，可手工恢复）；delete_topic=删除空专题（非空请逐篇删除）。' +
+      'delete/rename/move 必须由用户在 DSH 审批 UI 上逐次允许（ctx.approval），没有 confirm 参数；' +
+      '被拒绝/取消/审批通道不可用时不改动任何文件。迁移执行不在本工具内（只能在界面由用户确认）。',
+    parameters: {
+      action: {
+        type: 'string',
+        required: true,
+        enum: [...MANAGE_ACTIONS],
+        description: '要执行的整理动作。delete_paper/delete_topic/rename_paper/rename_topic/move_paper 需要用户在 DSH 审批 UI 上逐次允许；create_topic/add_paper 不需要审批。',
+      },
+      topic: {
+        type: 'string',
+        description: '专题路径（相对文献库根，可多级如 A/B）。create_topic/add_paper/delete_topic 用目标专题；rename_paper/delete_paper 用文献所在专题；move_paper/rename_topic 用源专题。',
+      },
+      name: {
+        type: 'string',
+        description: '文献名（不带 .pdf）。delete_paper/rename_paper/move_paper 必填；add_paper 可省略（默认取 source_path 的文件名；若文件名以 .pdf 结尾则去掉，大小写不敏感）。',
+      },
+      new_name: {
+        type: 'string',
+        description: 'rename_paper/rename_topic 的新名字（论文名不带 .pdf；专题可多级路径）。',
+      },
+      to_topic: {
+        type: 'string',
+        description: 'move_paper 的目标专题路径。必须已存在（不存在请先 create_topic）。',
+      },
+      source_path: {
+        type: 'string',
+        description: 'add_paper 的源 PDF 绝对路径。必须是常规文件（不接受符号链接/目录）、内容含 %PDF- 头、非空；源文件只读，不会被移动或删除。',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean', required: true },
+          action: { type: 'string', required: true, enum: [...MANAGE_ACTIONS] },
+          topic: { type: 'string', required: true, description: '动作完成后的专题路径（delete_topic 为被删专题；其余为目标/所在专题）。' },
+          name: { type: 'string', description: '文献名（论文级动作）。' },
+          new_name: { type: 'string', description: 'rename_* 完成后的新名字。' },
+          to_topic: { type: 'string', description: 'move_paper 的目标专题。' },
+          created: { type: 'boolean', description: 'create_topic：true=本次创建，false=已存在（幂等，无改动）。' },
+          bytes: { type: 'integer', description: 'add_paper：写入的字节数。' },
+          files: { type: 'array', required: true, items: { type: 'string' }, description: '受影响的文件名（不含目录）；create_topic/rename_topic 为空数组。' },
+          trashDir: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true, description: '删除动作的回收站绝对路径（恢复线索）；非删除或无隐藏条目时为 null。' },
+          trashRel: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true, description: '回收站相对 dataDir 的路径（恢复线索；不含服务端绝对路径）。' },
+          approval: { type: 'string', required: true, enum: ['not-required', 'allowed-once'], description: '本次是否经过用户审批：add/create=not-required；其余=allowed-once。' },
+          detachedSessions: { type: 'integer', required: true, description: '因改名/移动/删除而不再自动挂到该路径的伴读会话数（只读统计，不删历史）。' },
+          summary: { type: 'string', required: true, description: '人类可读摘要（与 render 文本同源）。' },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: value.summary }],
+    },
+    execute: async (args, exec) => {
+      const lang = manageLang()
+      try {
+        const action = normalizeManageAction(args.action, lang)
+        requireManageFields(action, args as Record<string, unknown>, lang)
+        // 已取消的调用不写任何字节（审批动作在 requestManageApproval 里还会再查一次）
+        if (signalAborted(exec)) throw approvalError(lang, 'cancelled', action)
+        switch (action) {
+          case 'create_topic': {
+            const topic = validateTopicPath(args.topic, false)
+            const r = await g.runExclusive([g.topicKey(topic)], () => createTopic(dataDir, topic))
+            invalidateMigrationPromptCache(dataDir)
+            const summary = formatSummary(lang, { action, topic: r.topic, created: r.created })
+            return {
+              ok: true, action, topic: r.topic, created: r.created, files: [],
+              trashDir: null, trashRel: null, approval: 'not-required' as const,
+              detachedSessions: 0, summary,
+            }
+          }
+          case 'add_paper': {
+            const topic = validateTopicPath(args.topic, false)
+            const sourcePath = String(args.source_path)
+            // 锁键只需目录/文献两份（名字仅用于互斥；权威解析与校验在 addPaper 内部）
+            const keys = [g.topicKey(topic)]
+            const lockName = typeof args.name === 'string' && args.name.trim() !== ''
+              ? args.name.trim()
+              : basename(sourcePath).replace(/\.pdf$/i, '')
+            if (lockName) keys.push(g.paperKey(topic, lockName))
+            const r = await g.runExclusive(keys, () => addPaper(dataDir, topic, sourcePath, args.name))
+            invalidateMigrationPromptCache(dataDir)
+            const summary = formatSummary(lang, { action, topic: r.topic, name: r.name, bytes: r.bytes, sourceName: r.sourceName })
+            return {
+              ok: true, action, topic: r.topic, name: r.name, bytes: r.bytes, files: [`${r.name}.pdf`],
+              trashDir: null, trashRel: null, approval: 'not-required' as const,
+              detachedSessions: 0, summary,
+            }
+          }
+          case 'move_paper': {
+            const fromTopic = validateTopicPath(args.topic, true)
+            const toTopic = validateTopicPath(args.to_topic, true)
+            const name = validateEntryBoundary(args.name, 'paper')
+            // 只读预检先行（含旧布局拒绝 / 目标冲突 / 自子树）——**不打扰用户**再点审批（§1.6 顺序）
+            const plan = planMovePaper(dataDir, fromTopic, name, toTopic)
+            const run = await g.runExclusive(
+              [
+                g.topicKey(plan.topic), g.paperKey(plan.topic, plan.name),
+                g.topicKey(plan.toTopic), g.paperKey(plan.toTopic, plan.name),
+              ],
+              async () => {
+                const ref = { topic: plan.topic, name: plan.name }
+                await g.requirePaperClear(ref)
+                assertTranslationIdle(lang, [paperRefFor(dataDir, plan.topic, plan.name)])
+                const detached = (await g.sessionInfo(ref)).total
+                await requestManageApproval({
+                  ctx, exec, lang, action,
+                  reason: approvalReason(action, { topic: plan.topic, name: plan.name, toTopic: plan.toTopic, fileCount: plan.moved.length }),
+                })
+                const r = movePaper(dataDir, plan.topic, plan.name, plan.toTopic)
+                return { r, detached }
+              },
+            )
+            invalidateMigrationPromptCache(dataDir)
+            const summary = formatSummary(lang, {
+              action, topic: plan.topic, name: plan.name, toTopic: plan.toTopic,
+              fileCount: run.r.moved.length, detached: run.detached,
+            })
+            return {
+              ok: true, action, topic: plan.topic, name: plan.name, to_topic: plan.toTopic,
+              files: run.r.moved, trashDir: null, trashRel: null, approval: 'allowed-once' as const,
+              detachedSessions: run.detached, summary,
+            }
+          }
+          case 'rename_paper': {
+            const topic = validateTopicPath(args.topic, true)
+            const name = validateEntryBoundary(args.name, 'paper')
+            const newName = validatePaperName(args.new_name)
+            const plan = planPaperDelete(dataDir, topic, name)   // 只读：存在性 / 产物 / `.pdf` 常规文件
+            if (newName === plan.name) {
+              throw toolErr('bad-request', 400, '新名称与原名称相同', 'The new name equals the current name', lang)
+            }
+            const run = await g.runExclusive([g.topicKey(plan.topic), g.paperKey(plan.topic, plan.name)], async () => {
+              const ref = { topic: plan.topic, name: plan.name }
+              await g.requirePaperClear(ref)
+              assertTranslationIdle(lang, [paperRefFor(dataDir, plan.topic, plan.name)])
+              const detached = (await g.sessionInfo(ref)).total
+              await requestManageApproval({
+                ctx, exec, lang, action,
+                reason: approvalReason(action, { topic: plan.topic, name: plan.name, newName, fileCount: plan.files.length }),
+              })
+              const r = renamePaper(dataDir, plan.topic, plan.name, newName)
+              return { r, detached }
+            })
+            invalidateMigrationPromptCache(dataDir)
+            const summary = formatSummary(lang, {
+              action, topic: plan.topic, name: plan.name, newName: run.r.to,
+              fileCount: run.r.moved.length, detached: run.detached,
+            })
+            return {
+              ok: true, action, topic: plan.topic, name: plan.name, new_name: run.r.to,
+              files: run.r.moved, trashDir: null, trashRel: null, approval: 'allowed-once' as const,
+              detachedSessions: run.detached, summary,
+            }
+          }
+          case 'rename_topic': {
+            const topic = validateTopicPath(args.topic, true)
+            const newTopic = validateTopicPath(args.new_name, false)
+            if (newTopic === topic) {
+              throw toolErr('bad-request', 400, '新名称与原名称相同', 'The new name equals the current name', lang)
+            }
+            const plan = planTopicDelete(dataDir, topic)   // 只读：存在性 / 符号链接 / 越界
+            const run = await g.runExclusive([g.topicKey(plan.name), g.topicKey(newTopic)], async () => {
+              await g.requireTopicClear(plan.name)
+              const papers = listPapers(dataDir, plan.name).map((p) => paperRefFor(dataDir, p.topic, p.name))
+              assertTranslationIdle(lang, papers)
+              let detached = 0
+              for (const ref of papers) detached += (await g.sessionInfo(ref)).total
+              await requestManageApproval({
+                ctx, exec, lang, action,
+                reason: approvalReason(action, { topic: plan.name, newName: newTopic }),
+              })
+              const r = renameTopic(dataDir, plan.name, newTopic)
+              return { r, detached }
+            })
+            invalidateMigrationPromptCache(dataDir)
+            g.topicPathChanged(plan.name)   // 清工作区缓存（R6/D8）
+            const summary = formatSummary(lang, { action, topic: plan.name, newName: run.r.to, detached: run.detached })
+            return {
+              ok: true, action, topic: plan.name, new_name: run.r.to, files: [],
+              trashDir: null, trashRel: null, approval: 'allowed-once' as const,
+              detachedSessions: run.detached, summary,
+            }
+          }
+          case 'delete_paper': {
+            const topic = validateTopicPath(args.topic, true)
+            const name = validateEntryBoundary(args.name, 'paper')
+            const plan = planPaperDelete(dataDir, topic, name)   // 只读：不存在就不打扰用户点审批（B10）
+            const run = await g.runExclusive([g.topicKey(plan.topic), g.paperKey(plan.topic, plan.name)], async () => {
+              const ref = { topic: plan.topic, name: plan.name }
+              await g.requirePaperClear(ref)
+              assertTranslationIdle(lang, [paperRefFor(dataDir, plan.topic, plan.name)])
+              const detached = (await g.sessionInfo(ref)).total
+              await requestManageApproval({
+                ctx, exec, lang, action,
+                reason: approvalReason(action, { topic: plan.topic, name: plan.name, fileCount: plan.files.length, totalBytes: plan.totalBytes }),
+              })
+              const r = deletePaper(dataDir, plan.topic, plan.name)
+              return { r, detached }
+            })
+            invalidateMigrationPromptCache(dataDir)
+            const summary = formatSummary(lang, {
+              action, topic: plan.topic, name: plan.name, fileCount: run.r.moved.length,
+              totalBytes: plan.totalBytes, trashRel: run.r.trashRel, detached: run.detached,
+            })
+            return {
+              ok: true, action, topic: plan.topic, name: plan.name, files: run.r.moved,
+              trashDir: run.r.trashDir, trashRel: run.r.trashRel, approval: 'allowed-once' as const,
+              detachedSessions: run.detached, summary,
+            }
+          }
+          case 'delete_topic': {
+            const topic = validateTopicPath(args.topic, true)
+            const plan = planTopicDelete(dataDir, topic)   // 只读：存在性 / 非空判定
+            // 非空即拒（本工具**不提供**批量清空：清空只留在界面，破坏性操作逐次批准）
+            if (plan.entries.length > 0) {
+              throw toolErr('topic-not-empty', 409,
+                `专题内还有 ${plan.entries.length} 个条目（${plan.papers.length} 篇文献）；本工具只删空专题，请逐篇删除后再试`,
+                `Topic still has ${plan.entries.length} entries (${plan.papers.length} papers); this tool only deletes empty topics — delete papers one by one first`,
+                lang, { entries: plan.entries, papers: plan.papers, subtopics: plan.subtopics })
+            }
+            const run = await g.runExclusive([g.topicKey(plan.name)], async () => {
+              await g.requireTopicClear(plan.name)
+              const papers = listPapers(dataDir, plan.name).map((p) => paperRefFor(dataDir, p.topic, p.name))
+              assertTranslationIdle(lang, papers)
+              let detached = 0
+              for (const ref of papers) detached += (await g.sessionInfo(ref)).total
+              await requestManageApproval({
+                ctx, exec, lang, action,
+                reason: approvalReason(action, { topic: plan.name, hiddenCount: plan.hidden.length }),
+              })
+              const r = deleteTopic(dataDir, plan.name)
+              return { r, detached }
+            })
+            invalidateMigrationPromptCache(dataDir)
+            g.topicPathChanged(plan.name)
+            const summary = formatSummary(lang, {
+              action, topic: plan.name, trashRel: run.r.trashRel, hiddenCount: run.r.movedHidden.length,
+            })
+            return {
+              ok: true, action, topic: plan.name, files: run.r.movedHidden,
+              trashDir: run.r.trashDir, trashRel: run.r.trashRel, approval: 'allowed-once' as const,
+              detachedSessions: run.detached, summary,
+            }
+          }
+          default:
+            throw toolErr('bad-request', 400, '未知 action', 'Unknown action', lang)
+        }
+      } catch (err) {
+        if (isManageError(err)) throw withToolPrefix(lang, dataDir, err)
+        throw err
+      }
+    },
+  })
+  /* 注册前的最后一道统一化：`defineTool` 会**先按参数 schema 校验**（含 action 枚举）并在越界时抛
+     `ToolArgsError`（不带 ManageError 的 code/status）。这里把它翻译成本工具的 `bad-request`，
+     让「参数不合法」对模型/调用方是**同一个错误码**（§4.1），同时保留框架给出的具体原因。
+     （运行时对象只是原始定义 + 一层 execute 包装，schema/渲染完全不变。） */
+  ctx.tools.register({
+    ...libraryManageTool,
+    async execute(args, exec) {
+      try {
+        return await libraryManageTool.execute(args, exec)
+      } catch (err) {
+        // 用**结构化判定**（不 import ToolArgsError）：peer 范围是 >=0.1.5-rc.1，旧小版本未必导出该类名，
+        // `instanceof undefined` 会在运行时抛 TypeError；按 name/violations 判定跨版本都稳。
+        const e = err as { name?: unknown; message?: unknown; violations?: unknown }
+        if (e?.name === 'ToolArgsError' || Array.isArray(e?.violations)) {
+          const lang = manageLang()
+          const detail = Array.isArray(e.violations) ? e.violations.join('; ') : String(e.message ?? '')
+          throw toolErr('bad-request', 400, `参数不合法：${detail}`, `Invalid arguments: ${detail}`, lang)
+        }
+        throw err
+      }
+    },
+  } as typeof libraryManageTool)
 }

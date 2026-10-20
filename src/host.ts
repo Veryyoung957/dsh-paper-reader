@@ -38,6 +38,7 @@ import {
   validateTopicPath,
 } from './library-manage.ts'
 import { readFormulaIndex, readTextBlockIndex } from './formulas.ts'
+import { createLibraryGuards, type LibraryGuards } from './library-guards.ts'
 import { buildScopeContext, type AskScope } from './scope.ts'
 import {
   MAX_CHUNKS,
@@ -211,13 +212,17 @@ function decodeHdr(v: unknown): unknown {
   }
 }
 
-export function registerRoutes(ctx: Context, config: PluginConfig) {
+export function registerRoutes(ctx: Context, config: PluginConfig, guards?: LibraryGuards) {
   const ws = (ctx as unknown as { webServer: WebServer }).webServer
   const connection = (ctx as unknown as { connection: ConnectionLike }).connection
   const sessionController = (ctx as unknown as { sessionController: SessionControllerLike }).sessionController
   const workspaceController = (ctx as unknown as { workspaceController: WorkspaceControllerLike }).workspaceController
   const workspaceRegistry = (ctx as unknown as { workspaceRegistry?: WorkspaceRegistryLike }).workspaceRegistry
   const dataDir = resolveDataDir(config.dataDir)
+  // 破坏性操作的共用前置（会话准入 / 在途锁 / 缓存钩子）：**必须**与 agent 工具共用同一个实例
+  // （src/index.ts 显式创建并双传），否则「路由在途」与「工具在途」互相看不见（计划 §3.3.4/R8）。
+  // 第三参缺省时自建一个 —— 只服务于既有测试（不传 = 不共享，锁只在本次路由注册内生效）。
+  const g = guards ?? createLibraryGuards(dataDir)
   // dist/host.js → 包根/reader/index.html
   const readerHtml = new URL('../reader/index.html', import.meta.url)
   const readerVendorDir = new URL('../reader/vendor/', import.meta.url)
@@ -270,6 +275,8 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
     for (const s of out) byN.set(s.n, s)
     return [...byN.values()].sort((a, b) => a.n - b.n)
   }
+  // 会话准入下沉到 guards（agent 工具与路由共用同一份 fail-closed 语义，见 §3.3.1）
+  g.setPaperSessionScanner(scanPaperSessions)
 
   /** 列表视图：过滤归档集；空白会话（从未提问）只保留最新一个——更早的空会话是被遗弃的
    *  「新建对话」，顺手真归档（官方语义：日志保留、所有列表隐藏），不只是从树上消失。 */
@@ -304,6 +311,8 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
       if (k === base || k.startsWith(prefix)) workspaceCache.delete(k)
     }
   }
+  // 专题路径变化后的副作用下沉到 guards：agent 工具改名/删除专题成功后同样要清缓存（R6/D8）
+  g.setTopicPathChangedHook(dropWorkspaceCache)
   const ensureTopicWorkspace = async (topic: string): Promise<string | undefined> => {
     const dir = join(dataDir, topic)
     const cached = workspaceCache.get(dir)
@@ -369,79 +378,31 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
   /**
    * 某文献的伴读会话统计。**查不到就标 unknown**（不再吞成「0 个会话」）：
    * R4-F3 指出 fail-open 会削弱 S7「有运行中会话就拒绝」——会话服务不可用时无法证明「没有运行中会话」，
-   * 破坏性操作据 unknown 走 fail-closed（见 requireSessionClear）。读路径不受影响（只有破坏性路由用它）。
+   * 破坏性操作据 unknown 走 fail-closed（见 guards.requirePaperClear）。读路径不受影响。
+   * 实现已下沉到 `src/library-guards.ts`（agent 工具复用同一份），这里只保留响应整形。
    */
   /** 对外形状固定为 `{total, running}`（既有断言 deepEqual 它）；`unknown` 只在服务端内部用。 */
   const toWire = (i: { total: number; running: number }): { total: number; running: number } => ({ total: i.total, running: i.running })
 
-  const sessionInfo = async (ref: { topic: string; name: string }): Promise<{ total: number; running: number; unknown: boolean }> => {
-    if (typeof sessionController?.list !== 'function') return { total: 0, running: 0, unknown: true }
-    try {
-      const s = await scanPaperSessions(ref)
-      return { total: s.length, running: s.filter((x) => x.running).length, unknown: false }
-    } catch {
-      return { total: 0, running: 0, unknown: true }
-    }
-  }
+  const sessionInfo = (ref: { topic: string; name: string }): Promise<{ total: number; running: number; unknown: boolean }> =>
+    g.sessionInfo(ref)
 
   /**
-   * 破坏性操作的会话准入（**fail-closed**）：查不到会话状态就**拒绝**，不冒险动手。
-   * 取向理由：删除会把产物搬进回收站、重命名会改会话工作区下的文件名；若此时真有会话在跑，
-   * 破坏的是用户当前正在用的工作目录。代价是「会话服务抖动时可能白拒一次」，用户重试即可——
-   * 可恢复性远好于误删。unknown 用 503 + code=session-unknown，running 用 409 + code=session-running。
+   * 契约 R5「并发互斥」的最小在途守卫（R4-F2）：同一目标的删除/重命名/移动在途时，第二个请求直接
+   * 409 `busy`（而不是让两个请求交错改同一批文件）。Set 已下沉到 guards（与 agent 工具共用）；
+   * 这里保留原来的单键薄壳，锁键集合按计划 §3.3.3 扩展到 topic 级（多键）。
    */
-  const requireSessionClear = async (ref: { topic: string; name: string }, res: Res): Promise<boolean> => {
-    const info = await sessionInfo(ref)
-    if (info.unknown) {
-      json(res, 503, { error: '暂时无法确认该文献的伴读会话状态，为避免误删已取消本次操作；请稍后重试', code: 'session-unknown' })
-      return false
-    }
-    if (info.running > 0) {
-      json(res, 409, { error: `该文献有 ${info.running} 个正在运行的伴读会话，请先结束后再操作`, code: 'session-running', sessions: toWire(info) })
-      return false
-    }
-    return true
-  }
-
-  /** 专题级会话准入：该专题内任一篇文献会话状态不明/在跑 → 拒绝。 */
-  const requireTopicSessionsClear = async (topic: string, res: Res): Promise<boolean> => {
-    for (const p of listPapers(dataDir, topic)) {
-      if (!(await requireSessionClear(p, res))) return false
-    }
-    return true
-  }
-
-  /**
-   * 契约 R5「并发互斥」的最小在途守卫（R4-F2）：
-   * 同一篇文献的删除/重命名在途时，第二个请求直接 409 `busy`（而不是让两个请求交错改同一批文件：
-   * 实测后果是第二个请求拿到 404/500 的中间态）。进程内 Set 足够——本插件是单进程 ws 路由。
-   * 机器码取 `busy` 而非契约 §5 R5 字面的 `in-progress`：两者语义完全一致（「有操作在途」），
-   * `busy` 更短且与既有 `translation-busy`/`session-running` 的短词风格一致；前端 errText 已按 `busy` 对齐。
-   */
-  const inflight = new Set<string>()
-  const withInflight = async (key: string, res: Res, fn: () => Promise<void>): Promise<void> => {
-    if (inflight.has(key)) {
+  const withInflight = async (keys: string | string[], res: Res, fn: () => Promise<void>): Promise<void> => {
+    const keyList = typeof keys === 'string' ? [keys] : keys
+    if (!g.tryAcquire(keyList)) {
       json(res, 409, { error: '同一篇文献的另一个删除/重命名操作正在进行，请稍后重试', code: 'busy' })
       return
     }
-    inflight.add(key)
     try {
       await fn()
     } finally {
-      inflight.delete(key)
+      g.release(keyList)
     }
-  }
-
-  /**
-   * 该范围（或其子树）是否有写操作在途。读路径**不阻塞**（方案 §B3.2：fail-soft），
-   * 只在提示里如实说「正在被修改，本次只给了 N 篇」。
-   */
-  const scopeBusy = (scopePath: string): boolean => {
-    const needle = scopePath
-    for (const k of inflight) {
-      if (k.includes(needle)) return true
-    }
-    return false
   }
 
   /** 「文献不存在」的统一出口：404 + 不含服务端绝对路径的文案（原先普通 Error 会冒泡成 500 并带路径）。 */
@@ -557,26 +518,34 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
     // `.hidden`/超长/含控制字符的名字都能被创建，却是删不掉的孤儿）。
     if (sub === '/api/library/topic' && req.method === 'POST') {
       const body = (await readBody(req)) as { name?: string }
+      let name: string
       try {
-        // name 是**相对路径**（`A` / `A/B`）：逐段词法校验 + 「已存在的祖先必须是库内真目录」。
-        // mkdir(recursive) 天然能一次建多级（方案 §B2.2「天然建多级」）；这里挡的是父链里**已存在**的那几段
-        // ——符号链接 / 指向库外的段一律拒（不隐式穿越），不存在的段交给 mkdir 创建。
-        const name = validateTopicPath(body.name, false)
-        const root = realDataDir(dataDir)
-        const segs = name.split('/')
-        for (let i = 1; i < segs.length; i++) {
-          if (!existsSync(join(root, ...segs.slice(0, i)))) break
-          resolveTopicDir(dataDir, segs.slice(0, i).join('/'))
-        }
-        const dir = join(root, ...segs)
-        // 已存在 → 必须是真目录且不是符号链接（与 upload 同一条链路）；不存在 → 词法层已保证不越界
-        if (existsSync(dir)) resolveTopicDir(dataDir, name)
-        else assertInside(root, dir)
-        await mkdir(dir, { recursive: true })
-        json(res, 200, { ok: true, topic: name })
+        name = validateTopicPath(body.name, false)
       } catch (err) {
         if (!manageFail(res, err)) throw err
+        return
       }
+      await withInflight(g.topicKey(name), res, async () => {
+        try {
+          // name 是**相对路径**（`A` / `A/B`）：逐段词法校验 + 「已存在的祖先必须是库内真目录」。
+          // mkdir(recursive) 天然能一次建多级（方案 §B2.2「天然建多级」）；这里挡的是父链里**已存在**的那几段
+          // ——符号链接 / 指向库外的段一律拒（不隐式穿越），不存在的段交给 mkdir 创建。
+          const root = realDataDir(dataDir)
+          const segs = name.split('/')
+          for (let i = 1; i < segs.length; i++) {
+            if (!existsSync(join(root, ...segs.slice(0, i)))) break
+            resolveTopicDir(dataDir, segs.slice(0, i).join('/'))
+          }
+          const dir = join(root, ...segs)
+          // 已存在 → 必须是真目录且不是符号链接（与 upload 同一条链路）；不存在 → 词法层已保证不越界
+          if (existsSync(dir)) resolveTopicDir(dataDir, name)
+          else assertInside(root, dir)
+          await mkdir(dir, { recursive: true })
+          json(res, 200, { ok: true, topic: name })
+        } catch (err) {
+          if (!manageFail(res, err)) throw err
+        }
+      })
       return
     }
 
@@ -712,12 +681,12 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
       if (rejectWritePath(body, res)) return
       const topicPath = badTopicPath(res, body.topic, true)
       if (topicPath === null) return
-      await withInflight(`${topicPath}\u0000${String(body.name ?? '')}`, res, async () => {
+      await withInflight([g.topicKey(topicPath), g.paperKey(topicPath, String(body.name ?? ''))], res, async () => {
         try {
           const plan = planPaperDelete(dataDir, body.topic, body.name)
           const ref = resolveLibraryPaper(plan.topic, plan.name)
           const sessions = await sessionInfo(ref)          // 全部前提先校验，再动手
-          if (!(await requireSessionClear(ref, res))) return
+          await g.requirePaperClear(ref)                   // unknown→503 / running→409（guards 抛 ManageError）
           if (zhStatus(ref).busy) {
             throw new ManageError('translation-busy', 409, '该文献正在生成译文，请等待完成后再删除', {})
           }
@@ -740,14 +709,14 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
       if (rejectWritePath(body, res)) return
       const topicPath = badTopicPath(res, body.topic, true)
       if (topicPath === null) return
-      await withInflight(`${topicPath}\u0000${String(body.name ?? '')}`, res, async () => {
+      await withInflight([g.topicKey(topicPath), g.paperKey(topicPath, String(body.name ?? ''))], res, async () => {
         try {
           // 先校验名称/越界/存在（planPaperDelete 内部做全套检查）——不能先 resolvePaper：
           // 非法名会在那里抛出非 ManageError 的普通错误，被外层记成 500。
           const plan = planPaperDelete(dataDir, body.topic, body.name)
           const ref = resolveLibraryPaper(plan.topic, plan.name)
           const sessions = await sessionInfo(ref)
-          if (!(await requireSessionClear(ref, res))) return
+          await g.requirePaperClear(ref)
           if (zhStatus(ref).busy) {
             throw new ManageError('translation-busy', 409, '该文献正在生成译文，请等待完成后再重命名', {})
           }
@@ -778,7 +747,7 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
       // ② 命名规范类（长度/前导点/非 NUL 控制字符）只对「创建 / 改名-to」强制；删除/改名-from
       //    走 badEntryBoundary（分层理由见其定义：历史遗留的不规范名必须能清掉，否则是删不掉的孤儿）。
       if (rejectWritePath(body, res)) return
-      await withInflight(`topic\u0000${topicPath}`, res, async () => {
+      await withInflight(g.topicKey(topicPath), res, async () => {
         try {
           const name = topicPath
           // confirmName 是**可选**栅栏：给了就必须一致（400 confirm-mismatch）；没给也照走全部前置——
@@ -797,7 +766,7 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
               clearPlanEndpoint: '/api/library/topic/clear-plan',
             })
           }
-          if (!(await requireTopicSessionsClear(plan.name, res))) return
+          await g.requireTopicClear(plan.name)
           let busy = 0
           for (const p of listPapers(dataDir, plan.name)) {
             if (zhStatus(resolveLibraryPaper(p.topic, p.name)).busy) busy++
@@ -828,21 +797,17 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
       const toPath = badTopicPath(res, rawTo, false)
       if (toPath === null) return
       if (rejectWritePath(body, res)) return
-      await withInflight(`topic\u0000${topicPath}`, res, async () => {
+      await withInflight([g.topicKey(topicPath), g.topicKey(toPath)], res, async () => {
         try {
           const name = topicPath
           const plan = planTopicDelete(dataDir, name)      // 复用同一个「存在且合法」校验
-          if (!(await requireTopicSessionsClear(plan.name, res))) return
+          await g.requireTopicClear(plan.name)
           let busy = 0
           let detached = 0
           for (const p of listPapers(dataDir, plan.name)) {
             const ref = resolveLibraryPaper(p.topic, p.name)
-            const s = await sessionInfo(ref)
-            if (s.unknown) {
-              json(res, 503, { error: '暂时无法确认该专题的伴读会话状态，为避免误删已取消本次操作；请稍后重试', code: 'session-unknown' })
-              return
-            }
-            detached += s.total
+            // requireTopicClear 已保证每篇都不是 unknown（否则上一步就 503 了），这里只取统计值
+            detached += (await sessionInfo(ref)).total
             if (zhStatus(ref).busy) busy++
           }
           if (busy > 0) throw new ManageError('translation-busy', 409, '该专题有正在生成译文的文献，请等待完成后再重命名', {})
@@ -919,7 +884,7 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
         json(res, 400, { error: '需要 confirmName 与专题名完全一致才允许清空', code: 'confirm-mismatch' })
         return
       }
-      await withInflight(`topic\u0000${topicPath}`, res, async () => {
+      await withInflight(g.topicKey(topicPath), res, async () => {
         try {
           const plan = planTopicClear(dataDir, topicPath)   // 存在性 404 / 越界 400 / 符号链接专题 400
           if (plan.papersCount === 0) {
@@ -930,7 +895,7 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
           for (const p of plan.papers) {
             // 逐篇用**它自己的**专题路径定位（子树清空时根 topic 不再是每篇的父级）
             const ref = resolveLibraryPaper(p.topic, p.name)
-            if (!(await requireSessionClear(ref, res))) return   // unknown→503 / running→409（同一套 code）
+            await g.requirePaperClear(ref)                 // unknown→503 / running→409（同一套 code）
             detached += (await sessionInfo(ref)).total
             if (zhStatus(ref).busy) busyTrans.push(p.name)
           }
@@ -1728,7 +1693,7 @@ export function registerRoutes(ctx: Context, config: PluginConfig) {
         try {
           const ctx = buildScopeContext(dataDir, ref, scope, body.question)
           lines.push(ctx.block)
-          if (scopeBusy(ctx.scopePath)) {
+          if (g.isBusy(ctx.scopePath)) {
             lines.push(`（提示：该范围内的目录正在被修改，本次只给了 ${ctx.papers.length - ctx.omitted} 篇）`)
           }
           scopeInfo = {

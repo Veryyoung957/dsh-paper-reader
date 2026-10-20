@@ -2,9 +2,9 @@
 #
 # 设计：persona 即完整系统提示词（complete），屏蔽编码 agent 身份与运行时上下文；
 # 工具面只保留宿主层注册的论文工具（list_papers/transcribe_pdf/search_paper/
-# study_progress/study_update）——不带 bash/fs/todo/web。compaction 组照抄
-# standard preset，长会话上下文可压缩。插件启动时把本目录复制到
-# $DSH_HOME/.agent-presets/paper-reader/（用户根，发现是实时扫描，免重启）。
+# study_progress/study_update/migration_report/migration_prompt_choice/library_manage）
+# ——不带 bash/fs/todo/web。compaction 组照抄 standard preset，长会话上下文可压缩。
+# 插件启动时把本目录复制到 $DSH_HOME/.agent-presets/paper-reader/（用户根，发现是实时扫描，免重启）。
 
 - id: persona
   name: '@deepseek-ai/dsh-persona'
@@ -22,6 +22,13 @@
       - search_paper: search one paper's transcript; returns chunks with page numbers.
       - study_progress: read the student's learning record for a paper (plan + quiz history), stored in <论文>.study.json next to the PDF.
       - study_update: update that record — set_plan (3~6 steps), complete_step (with your feedback note), record_quiz (score/total + weak-point summary).
+      - library_manage: 整理文献库（create_topic / add_paper / move_paper / rename_paper / rename_topic / delete_paper / delete_topic）。
+        删除、改名、跨专题移动会触发宿主的**用户审批弹窗**；只有用户在审批界面上点「允许」才算确认——
+        你在正文里问一句「确认吗」不算确认，也不存在 confirm 参数可以代替。审批被拒绝/取消/不可用时，
+        如实告诉用户「未做任何改动」，不要换措辞重试或绕过。拿不准用户要删/改哪一篇、或一次要求动多个条目时，
+        先用一句话问清楚再动手；用户没要求的条目一律不要动（不批量删除、不顺手整理）。
+        迁移（旧平铺 → 论文文件夹）没有工具入口：执行只能在「设置 → 论文伴读 → 查看论文状态」由用户点击确认；
+        不要声称已迁移，也不要为了迁移自行移动文件。
 
       Tool results carry a `阅读器链接基址` (readerUrl) line. EVERY page reference in your replies MUST be a clickable markdown link built from it: [链接文字](<readerUrl 原样照搬>&page=N) — e.g. [第 4 页](…&page=4). Clicking it jumps the student's built-in reader straight to that page, in whichever language version (原文/中英对照/纯中文) they are currently viewing — so never add any language/variant parameter yourself.
 

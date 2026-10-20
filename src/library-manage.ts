@@ -9,7 +9,10 @@
 //
 // 本模块不依赖 Cordis，可直接被测试 import（dist/library-manage.js）。
 
-import { lstatSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync, rmdirSync, writeFileSync, existsSync } from 'node:fs'
+import {
+  closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync,
+  renameSync, rmSync, rmdirSync, statSync, unlinkSync, writeFileSync,
+} from 'node:fs'
 // 共享的**边界原语**（上游 #4 的路径穿越修复，逐字保留在 library.ts）：
 // validateEntryName / validateEntryBoundary / realDataDir / assertInside。
 // 注意口径（评审 F-F）：组合层**两套并存**——生产写路径用本模块的 resolveTopicDirChecked
@@ -53,6 +56,23 @@ export type ManageCode =
   // 契约 §5 R5 的并发互斥机器码字面为 `in-progress`；实现统一用更简洁的 `busy`（语义一致），
   // 已在 host.ts 的 withInflight 注释与前端 errText 对齐。见 src/host.ts。
   | 'busy'
+  // ── agent 文献整理工具（docs/library-manage-tools-plan.md §3.2.1）─────────────
+  // 收录（add_paper）的源文件边界：源是用户显式给的本地文件，不是库内路径。
+  | 'source-not-found'
+  | 'source-invalid'
+  | 'source-not-pdf'
+  | 'source-empty'
+  // 移动（move_paper）：旧布局一律拒绝（迁移只能在界面执行，对话侧没有迁移执行路径）。
+  | 'legacy-layout'
+  // 收录/移动/建专题的写入中途失败（已回滚或部分残留，extra 说明）。
+  | 'add-partial'
+  | 'move-partial'
+  // 伴读会话状态不可知：host 原本用裸 json 输出，工具层需要机器码，故统一进闭集。
+  | 'session-unknown'
+  // 审批（ctx.approval.request）四态里除 allowed-once 之外的三态（fail closed）。
+  | 'approval-rejected'
+  | 'approval-cancelled'
+  | 'approval-unavailable'
 
 /** HTTP 状态与机器可读 code 双携带；`extra` 会并入响应体（前端只认 code，不匹配中文）。 */
 export class ManageError extends Error {
@@ -118,13 +138,33 @@ export function validateEntryBoundary(raw: unknown, label: 'topic' | 'paper'): s
   return raw
 }
 
-/** 文献名不得以 pdf2zh 变体后缀结尾（否则 isPaperPDF 视其为非文献 → 从库里消失）。 */
-export function validateNewPaperName(raw: unknown, current: string): string {
+/**
+ * 新建/收录的**论文名**规范（agent 文献整理工具新增；docs/library-manage-tools-plan.md §3.2.2）：
+ * 命名规范类 + 两条针对文献库语义的加严：
+ *   · 不带 `.pdf` 后缀（否则会生成 `<X.pdf>/<X.pdf>.pdf` 的嵌套怪名）；
+ *   · 不以 `-en/-zh/-dual` 结尾（`isPaperPDF` 会把它们当译文变体 ⇒ 收录后从库里「消失」）。
+ * 这是**纯重构**：把 `validateNewPaperName` 里已有的两条规则搬出来，供 add_paper 复用。
+ */
+export function validatePaperName(raw: unknown): string {
   const name = validateName(raw, 'paper')
-  if (name === current) throw new ManageError('bad-request', 400, '新名称与原名称相同')
-  if (/-(en|zh|dual)$/.test(name)) {
-    throw new ManageError('bad-name', 400, '新名称不能以 -en/-zh/-dual 结尾（会被当作 pdf2zh 变体而从文献库隐藏）')
+  if (name.toLowerCase().endsWith('.pdf')) {
+    throw new ManageError('bad-name', 400, '文献名不带 .pdf 后缀')
   }
+  // ⚠️ 与冻结方案 §3.2.2 的一处**有据偏离**：方案写的是 `/-en$|-zh$|-dual$/i`（大小写不敏感），
+  // 但库内既有契约是**大小写敏感**的——`isPaperPDF` 用大小写敏感比较（`src/library.ts`），
+  // 因此大写 `-ZH` 既不是变体、也不会被隐藏；`test/reader-ux-verification.test.mjs` 的 VB9/S12
+  // 明确钉住「大写 -ZH 改名允许、改名后文献仍在库里」。改成 `/i` 会把这条既有契约变成 400，
+  // 属实的回归。故这里**保持**原实现的敏感正则（与 `isPaperPDF` 同一口径），并在 C8 用例中钉住。
+  if (/-en$|-zh$|-dual$/.test(name)) {
+    throw new ManageError('bad-name', 400, '文献名不能以 -en/-zh/-dual 结尾（会被当作译文变体而从库中隐藏）')
+  }
+  return name
+}
+
+/** 文献改名目标名：`validatePaperName` + 拒绝与原名称相同（改名路由的既有语义）。 */
+export function validateNewPaperName(raw: unknown, current: string): string {
+  const name = validatePaperName(raw)
+  if (name === current) throw new ManageError('bad-request', 400, '新名称与原名称相同')
   return name
 }
 
@@ -1250,3 +1290,340 @@ export function renameTopic(dataDir: string, name: unknown, newNameRaw: unknown,
   }
   return { ok: true, moved: [], from: topic, to: newTopic }
 }
+// ── agent 文献整理工具的新写语义（建空专题 / 原子收录 / 整目录移动）─────────────
+// 契约：docs/library-manage-tools-plan.md §3.2.3–§3.2.5。三者的**校验/回收站/realpath**全部复用
+// 上面已有的实现（validateName / validateTopicPath / resolveTopicDir* / assertInside / realDataDir /
+// listArtifacts / planPaperDelete / moveToTrash / rename*），本段只补「路由里原本内联」与
+// 「工具新增」的写路径，不复制第二份校验。
+
+/**
+ * 创建（多级）专题 —— 与 `src/host.ts` 的 `POST /api/library/topic` **同构**：
+ * 逐段词法校验 → 对每个**已存在**的祖先走 `resolveTopicDir`（拒符号链接/逃逸）→ 已存在则复核后
+ * 幂等返回 `created:false`；否则 `assertInside` + `mkdir(recursive)`。
+ * 不写工作区缓存、不写 `.trash`、不做审批（只新增一个空目录）。
+ */
+export interface CreateTopicResult {
+  ok: true
+  topic: string
+  created: boolean
+}
+
+export function createTopic(dataDir: string, raw: unknown): CreateTopicResult {
+  const topic = validateTopicPath(raw, false)
+  const root = realDataDir(dataDir)
+  const segs = topic.split('/')
+  for (let i = 1; i < segs.length; i++) {
+    if (!existsSync(join(root, ...segs.slice(0, i)))) break
+    resolveTopicDir(dataDir, segs.slice(0, i).join('/'))
+  }
+  const dir = join(root, ...segs)
+  // 已存在 → 必须是库内真目录（不是符号链接）⇒ 幂等返回 created:false（路由也是 200）
+  if (existsSync(dir)) {
+    resolveTopicDir(dataDir, topic)
+    return { ok: true, topic, created: false }
+  }
+  assertInside(root, dir)
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    // 并发下被别人先建出来：仍是「已存在」语义（复核后返回 created:false，绝不覆盖内容）
+    if (code === 'EEXIST') {
+      resolveTopicDir(dataDir, topic)
+      return { ok: true, topic, created: false }
+    }
+    if (code === 'EBUSY' || code === 'EPERM') {
+      throw new ManageError('file-busy', 409, '位置被占用（可能正在阅读器或其他程序中打开），关闭后重试；本次未创建专题', { cause: code })
+    }
+    throw new ManageError('add-partial', 500, '创建专题失败（未做任何改动）', { cause: code ?? 'unknown' })
+  }
+  return { ok: true, topic, created: true }
+}
+
+export interface AddPaperOptions {
+  /** 复制实现（仅测试注入；默认 copyFileSync） */
+  copyImpl?: (from: string, to: string) => void
+  /** 落盘实现（仅测试注入；默认 linkSync；不可用时回退 renameSync） */
+  linkImpl?: (from: string, to: string) => void
+  renameImpl?: RenameImpl
+}
+
+export interface AddPaperResult {
+  ok: true
+  topic: string
+  name: string
+  bytes: number
+  /** 落盘后的 PDF 绝对路径（与 transcribe_pdf 的 txtPath 同为绝对路径） */
+  pdfPath: string
+  /** 源文件的 basename（不泄露源目录绝对路径；审批与文案只需要文件名） */
+  sourceName: string
+}
+
+/** PDF 魔数：读前 1024 字节找 ASCII `%PDF-`（允许前置少量垃圾，与 pdf.js 的容忍度一致）。 */
+function hasPdfMagic(path: string): boolean {
+  const fd = openSync(path, 'r')
+  try {
+    const buf = Buffer.alloc(1024)
+    const n = readSync(fd, buf, 0, 1024, 0)
+    return buf.subarray(0, n).includes('%PDF-')
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/**
+ * 把本地 PDF **原子**收录为一篇新文献（`<topicDir>/<name>/<name>.pdf`）。
+ *
+ * 源文件只读：不会被移动/删除；拒绝目录与符号链接（「符号链接不是文献」是全库不变量，
+ * 用户要收录链接目标请传 realpath）；要求非空且含 `%PDF-` 头。
+ *
+ * 目标冲突一律 409 且零写入（同名论文夹 / 平铺 `<name>.pdf` / 同名孤儿产物任一命中）。
+ * 落盘不覆盖：先写 `.tmp-<pid>-<8hex>`（`TMP_RE` 兼容，中途残留也能被产物清单精确识别），
+ * 再 `linkSync` 到最终名（`EEXIST` ⇒ target-exists）；文件系统不支持硬链接时回退同目录
+ * `renameSync`（`!existsSync` 先复核）。任何失败都把本次创建的东西清理到零改动。
+ */
+export function addPaper(
+  dataDir: string,
+  topic: unknown,
+  sourcePath: unknown,
+  name?: unknown,
+  opts: AddPaperOptions = {},
+): AddPaperResult {
+  if (typeof sourcePath !== 'string' || sourcePath.trim() === '') {
+    throw new ManageError('bad-request', 400, 'add_paper 需要 source_path（源 PDF 绝对路径）')
+  }
+  const topicName = validateTopicPath(topic, false)
+  const topicDir = resolveTopicDir(dataDir, topicName)
+  // 论文名先定（词法层在**任何写盘/读源之前**）：显式 name 优先，否则取源文件 basename 去掉 .pdf
+  let paperName: string
+  if (name !== undefined && name !== null && name !== '') {
+    paperName = validatePaperName(name)
+  } else {
+    const base = basename(resolve(sourcePath))
+    const stem = base.toLowerCase().endsWith('.pdf') ? base.slice(0, -4) : base
+    paperName = validatePaperName(stem)
+  }
+  const src = resolve(sourcePath)
+  let st
+  try {
+    st = lstatSync(src)
+  } catch {
+    throw new ManageError('source-not-found', 404, `源文件不存在或不可读：${basename(src)}`)
+  }
+  if (!st.isFile() || st.isSymbolicLink()) {
+    throw new ManageError('source-invalid', 400, '源必须是常规 PDF 文件（不接受目录/符号链接）')
+  }
+  if (st.size === 0) throw new ManageError('source-empty', 400, '源文件为空')
+  let realSrc: string
+  let pdfMagic: boolean
+  try {
+    realSrc = realpathSync(src)
+    pdfMagic = hasPdfMagic(realSrc)
+  } catch {
+    throw new ManageError('source-not-found', 404, `源文件不存在或不可读：${basename(src)}`)
+  }
+  if (!pdfMagic) throw new ManageError('source-not-pdf', 400, '源文件不是 PDF（缺 %PDF- 头）')
+  // 目标冲突（三条任一命中 ⇒ 409，零写入）：同名论文夹 / 平铺 pdf / 同名孤儿产物
+  if (existsSync(join(topicDir, paperName)) || existsSync(join(topicDir, paperName + '.pdf')) || listArtifacts(topicDir, paperName).length > 0) {
+    throw new ManageError('target-exists', 409, `已存在同名文献或残留产物：${paperName}`, { conflicts: [paperName] })
+  }
+  const targetDir = join(topicDir, paperName)
+  const finalPath = join(targetDir, paperName + '.pdf')
+  const tmpPath = join(targetDir, `${paperName}.pdf.tmp-${process.pid}-${randomBytes(4).toString('hex')}`)
+  const copyImpl = opts.copyImpl ?? copyFileSync
+  const linkImpl = opts.linkImpl ?? linkSync
+  const renameImpl = opts.renameImpl ?? renameSync
+  let dirCreated = false
+  let finalCreated = false
+  try {
+    mkdirSync(targetDir, { recursive: true, mode: 0o700 })
+    dirCreated = true   // 前置已确认不存在；工具层持 topic+paper 锁 ⇒ 单进程内不会撞（跨进程竞争不在本插件支持范围）
+    copyImpl(realSrc, tmpPath)
+    if (statSync(tmpPath).size !== st.size) {
+      throw new ManageError('add-partial', 500, '收录中断：复制结果与源文件大小不一致，已清理到零改动', { cause: 'size-mismatch' })
+    }
+    try {
+      linkImpl(tmpPath, finalPath)
+      finalCreated = true
+      try { unlinkSync(tmpPath) } catch { /* 临时名残留：清理阶段兜底 */ }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'EEXIST') {
+        throw new ManageError('target-exists', 409, `已存在同名文献：${paperName}`, { conflicts: [paperName] })
+      }
+      if (code === 'EPERM' || code === 'ENOSYS' || code === 'EOPNOTSUPP' || code === 'EXDEV') {
+        // 硬链接不可用（FAT/exFAT/部分网络盘）：同目录 rename，落盘前再复核一次「不覆盖」
+        if (existsSync(finalPath)) {
+          throw new ManageError('target-exists', 409, `已存在同名文献：${paperName}`, { conflicts: [paperName] })
+        }
+        renameImpl(tmpPath, finalPath)
+        finalCreated = true
+      } else {
+        throw err
+      }
+    }
+  } catch (err) {
+    const cause = (err as NodeJS.ErrnoException).code ?? 'unknown'
+    const cleanupFailed: string[] = []
+    for (const [what, p] of [['tempLeft', tmpPath], ['fileLeft', finalCreated ? finalPath : '']] as const) {
+      if (!p) continue
+      try {
+        if (existsSync(p)) rmSync(p, { force: true })
+      } catch { cleanupFailed.push(what) }
+    }
+    if (dirCreated) {
+      try { rmdirSync(targetDir) } catch { if (existsSync(targetDir)) cleanupFailed.push('dirLeft') }
+    }
+    if (isManageError(err)) throw err
+    if (cleanupFailed.length > 0) {
+      throw new ManageError('add-partial', 500, `收录中断且未能清理干净（残留：${cleanupFailed.join('、')}），请手动检查`, {
+        tempLeft: cleanupFailed.includes('tempLeft'), dirLeft: cleanupFailed.includes('dirLeft'), cause,
+      })
+    }
+    if (cause === 'EBUSY' || cause === 'EPERM') {
+      throw new ManageError('file-busy', 409, '文件被占用（可能正在阅读器或其他程序中打开），关闭后重试；本次收录未生效', { cause })
+    }
+    throw new ManageError('add-partial', 500, '收录中断，已清理到零改动', { cause })
+  }
+  return { ok: true, topic: topicName, name: paperName, bytes: st.size, pdfPath: finalPath, sourceName: basename(src) }
+}
+
+export interface MoveResult {
+  ok: true
+  /** 形如 `T/P` */
+  from: string
+  /** 形如 `S/P` */
+  to: string
+  name: string
+  /** 产物文件名（来自 listArtifacts；不含未知条目） */
+  moved: string[]
+  /** 论文夹里不属于产物族的条目（随目录一起搬走，如实报告） */
+  otherEntries: string[]
+}
+
+export interface MovePaperPlan {
+  /** 源专题（规范化后的相对路径） */
+  topic: string
+  /** 目标专题（规范化后的相对路径） */
+  toTopic: string
+  name: string
+  sourceDir: string
+  targetDir: string
+  files: ManagedFile[]
+  moved: string[]
+  otherEntries: string[]
+}
+
+/**
+ * movePaper 的**只读**前置（一个实现，两处消费：工具在审批前预检、movePaper 执行前复核）。
+ * 任一检查失败都抛 ManageError 且**零改动**；成功只返回计划，不碰盘。
+ */
+export function planMovePaper(dataDir: string, fromTopic: unknown, name: unknown, toTopic: unknown): MovePaperPlan {
+  const fromName = validateTopicPath(fromTopic, true)
+  const toName = validateTopicPath(toTopic, true)
+  const paperName = validateEntryBoundary(name, 'paper')
+  resolveExistingTopicDir(dataDir, fromName)   // 源专题必须存在（404 / 符号链接 400）
+  const toDir = resolveExistingTopicDir(dataDir, toName)   // 目标专题必须已存在（不隐式创建）
+  const plan = planPaperDelete(dataDir, fromName, paperName)   // 词法/存在性/产物包含性/`.pdf` 常规文件
+  if (plan.layout === 'legacy') {
+    throw new ManageError('legacy-layout', 409, '该文献仍是旧布局（未迁移），请先在界面执行迁移后再移动', {
+      topic: fromName, name: paperName,
+    })
+  }
+  const sourceDir = resolveExistingPaperDir(dataDir, fromName, plan.name)
+  const target = join(toDir, plan.name)
+  if (target === sourceDir) throw new ManageError('bad-request', 400, '目标专题与源专题相同')
+  if (existsSync(target) || existsSync(join(toDir, plan.name + '.pdf')) || listArtifacts(toDir, plan.name).length > 0) {
+    throw new ManageError('target-exists', 409, `目标专题已存在同名文献或残留产物：${toName}/${plan.name}`, {
+      conflicts: [`${toName}/${plan.name}`],
+    })
+  }
+  const selfPrefix = sourceDir.endsWith(sep) ? sourceDir : sourceDir + sep
+  if (target.startsWith(selfPrefix)) {
+    throw new ManageError('bad-request', 409, '不能把文献移动到它自己的子目录下', {
+      from: `${fromName}/${paperName}`, to: `${toName}/${plan.name}`,
+    })
+  }
+  assertInside(realDataDir(dataDir), target)
+  // 只读枚举（用于如实报告）：产物清单走既有精确 stem 匹配，其余条目按差集列出（它们随目录一起搬走）
+  const artifactNames = new Set(plan.files.map((f) => f.name))
+  let otherEntries: string[]
+  try {
+    otherEntries = readdirSync(sourceDir).filter((n) => !artifactNames.has(n)).sort()
+  } catch (err) {
+    // 目录不可读（EACCES/IO）：给出可执行文案，绝不把 errno 的绝对路径冒泡给调用方（S15/F5）
+    throw new ManageError('bad-request', 400, '论文文件夹不可读，已取消移动（未做任何改动）', {
+      cause: (err as NodeJS.ErrnoException).code ?? 'unknown',
+    })
+  }
+  return {
+    topic: fromName,
+    toTopic: toName,
+    name: plan.name,
+    sourceDir,
+    targetDir: target,
+    files: plan.files,
+    moved: plan.files.map((f) => f.name),
+    otherEntries,
+  }
+}
+
+/**
+ * 跨专题移动一篇论文 —— **一次目录 rename** `<fromTopicDir>/<name>` → `<toTopicDir>/<name>`：
+ * 不逐个搬文件、不改文件名、不重建 sidecar。论文夹内的全部产物（含译文变体/隐藏条目/用户自放文件）
+ * 都在同一目录树内，同文件系统 rename 是**原子**的，天然「全产物一起搬」。
+ *
+ * **拒绝旧布局**（`legacy-layout` 409）：把平铺产物收进论文文件夹 = 替用户执行了一篇迁移，
+ * 而迁移执行只能留在界面（docs/migrate-prompt-plan.md 红线）。
+ *
+ * 前置全部只读（见 planMovePaper）。rename 失败按 errno 映射（EBUSY/EPERM → 409 file-busy，
+ * 其它 → 500 move-partial）；rename 成功但后置校验不成立时尽力回滚，并如实报告
+ * rolledBack / rollbackFailed。
+ */
+export function movePaper(
+  dataDir: string,
+  fromTopic: unknown,
+  name: unknown,
+  toTopic: unknown,
+  renameImpl: RenameImpl = renameSync,
+): MoveResult {
+  const plan = planMovePaper(dataDir, fromTopic, name, toTopic)
+  try {
+    renameImpl(plan.sourceDir, plan.targetDir)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'EBUSY' || code === 'EPERM') {
+      throw new ManageError('file-busy', 409, '文件被占用（可能正在阅读器或其他程序中打开），关闭后重试；本次移动未生效', {
+        busy: plan.name, cause: code,
+      })
+    }
+    if (typeof code === 'string' && code) {
+      throw new ManageError('move-partial', 500, '移动文献失败（未生效）；文献库未改变', { cause: code })
+    }
+    throw new ManageError('move-partial', 500, '移动文献失败（未生效）；文献库未改变', { cause: 'unknown' })
+  }
+  // 后置校验：目标必须是论文目录、源目录必须已不存在；否则尽力回滚并如实报告
+  if (!isPaperDir(plan.targetDir) || existsSync(plan.sourceDir)) {
+    let rolledBack = false
+    try {
+      renameImpl(plan.targetDir, plan.sourceDir)
+      rolledBack = true
+    } catch { /* 回滚失败：如实报告，让用户手动检查 */ }
+    if (rolledBack) {
+      throw new ManageError('move-partial', 500, '移动后校验失败，已回滚；文献库未改变', { rolledBack: [plan.name] })
+    }
+    throw new ManageError('move-partial', 500,
+      `移动后校验失败且回滚未成功：论文可能在目标路径（${plan.toTopic}/${plan.name}），请手动检查`, {
+        rollbackFailed: [plan.name], trashRel: null,
+      })
+  }
+  return {
+    ok: true,
+    from: `${plan.topic}/${plan.name}`,
+    to: `${plan.toTopic}/${plan.name}`,
+    name: plan.name,
+    moved: plan.moved,
+    otherEntries: plan.otherEntries,
+  }
+}
+
