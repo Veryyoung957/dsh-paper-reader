@@ -380,6 +380,23 @@ const MUTATIONS = [
   { id: 'LM20-import-migration-executor', file: 'src/tools.ts', needsBuild: true, testFile: 'test/library-manage-tools.test.mjs', pattern: 'F1',
     from: 'import { formatMigrationReport, planMigration } from \'./migrate.ts\'', to: 'import { formatMigrationReport, planMigration, runMigration } from \'./migrate.ts\'',
     why: '工具层 import 迁移执行函数（F1 必红：红线）' },
+
+  // ── LM21–LM25 t4 评审 findings（F1/F2/F3/F4）的修复靶子（t6 repair-round-2）──
+  { id: 'LM21-rename-target-conflict-open', file: 'src/library-manage.ts', needsBuild: true, testFile: 'test/library-manage-tools.test.mjs', pattern: 'G1',
+    from: '  if (!dirHit && !flatHit && !artifactsHit) return', to: '  if (true) return',
+    why: 't4-F1 回退：rename 不再做三路目标冲突判定（G1 必红：既有 legacy 文献被遮蔽 + 审批被无谓打扰）' },
+  { id: 'LM22-layout-conflict-open', file: 'src/library-manage.ts', needsBuild: true, testFile: 'test/library-manage-tools.test.mjs', pattern: 'G2',
+    from: '  if (flat.length === 0) return', to: '  if (true) return',
+    why: 't4-F2 回退：混合布局（论文夹 + 同 stem 平铺残留）不再拒绝（G2a/G2b/G2c 必红：删完变 legacy 幽灵/旧名残留/两专题重复）' },
+  { id: 'LM23-move-other-entries-dropped', file: 'src/library-manage.ts', needsBuild: true, testFile: 'test/library-manage-tools.test.mjs', pattern: 'G3',
+    from: '    otherEntries = readdirSync(sourceDir).filter((n) => !artifactNames.has(n)).sort()', to: '    otherEntries = []',
+    why: 't4-F3 回退：move 不再枚举非产物条目（G3 必红：otherEntries 空、摘要不点名）' },
+  { id: 'LM24-delete-dirremoved-forced', file: 'src/tools.ts', needsBuild: true, testFile: 'test/library-manage-tools.test.mjs', pattern: 'G4',
+    from: '              ok: true, action, topic: plan.topic, name: plan.name, files: run.r.moved,\n              dirRemoved: run.r.dirRemoved,', to: '              ok: true, action, topic: plan.topic, name: plan.name, files: run.r.moved,\n              dirRemoved: true,',
+    why: 't4-F3 回退：delete 无视库层的 dirRemoved（G4 必红：目录未删净却报删净）' },
+  { id: 'LM25-approval-get-uncaught', file: 'src/tools.ts', needsBuild: true, testFile: 'test/library-manage-tools.test.mjs', pattern: 'G5',
+    from: '    svc = typeof get === \'function\' ? (get.call(ctx, \'approval\') as ApprovalAsk | undefined) : undefined\n  } catch {\n    throw approvalError(lang, \'unavailable\', action)\n  }', to: '    svc = typeof get === \'function\' ? (get.call(ctx, \'approval\') as ApprovalAsk | undefined) : undefined\n  } finally {\n    void 0\n  }',
+    why: 't4-F4 回退：ctx.get 抛错不再统一成 approval-unavailable（G5 必红：裸 Error 无机器码）' },
 ]
 
 const args = process.argv.slice(2)

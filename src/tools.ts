@@ -24,11 +24,11 @@ import {
   movePaper,
   planMovePaper,
   planPaperDelete,
+  planRenamePaper,
   planTopicDelete,
   renamePaper,
   renameTopic,
   validateEntryBoundary,
-  validatePaperName,
   validateTopicPath,
   type ManageCode,
 } from './library-manage.ts'
@@ -312,6 +312,7 @@ const EN_CODE_HINT: Partial<Record<ManageCode, string>> = {
   'trash-move-failed': 'Trash move failed',
   'rename-partial': 'Rename partially failed',
   'legacy-layout': 'Legacy layout; migrate in UI first',
+  'layout-conflict': 'Folder and flat residue coexist; migrate in UI first',
   'source-not-found': 'Source not found',
   'source-invalid': 'Source must be a regular file',
   'source-empty': 'Source is empty',
@@ -389,6 +390,10 @@ interface ManageSummaryInput {
   detached?: number
   sourceName?: string
   hiddenCount?: number
+  /** move_paper：随论文文件夹一起搬走的非产物条目（用户自放文件/子目录） */
+  otherEntries?: string[]
+  /** delete_paper：论文目录是否删净（false=里面还有非产物条目，被原样保留） */
+  dirRemoved?: boolean
 }
 
 /** summary / render 同源（§1.5）：zh 默认，DPR_LIBRARY_MANAGE_LANG=en 切 en。 */
@@ -406,10 +411,18 @@ function formatSummary(lang: ManageLang, s: ManageSummaryInput): string {
       return zh
         ? `已收录《${s.topic}/${s.name}》：${s.bytes} 字节，源文件 ${s.sourceName} 未被移动或删除`
         : `Added ${s.topic}/${s.name}: ${s.bytes} bytes; source ${s.sourceName} left untouched`
-    case 'move_paper':
-      return zh
+    case 'move_paper': {
+      // t4-F3：库层已算出 otherEntries（论文夹里不属于产物族的条目，随目录一起搬走），必须如实说
+      const other = s.otherEntries ?? []
+      const extra = other.length > 0
+        ? (zh
+            ? `；另有 ${other.length} 个非产物条目随目录一起搬走：${other.join('、')}`
+            : `; ${other.length} other entries moved along: ${other.join(', ')}`)
+        : ''
+      return (zh
         ? `已移动《${s.topic}/${s.name}》→《${s.toTopic}/${s.name}》：${s.fileCount} 个产物随论文文件夹整体移动，内容未改；${s.detached} 个伴读会话不再自动挂到新路径`
-        : `Moved ${s.topic}/${s.name} → ${s.toTopic}/${s.name}: ${s.fileCount} artifacts moved with the paper folder, contents unchanged; ${s.detached} reader sessions no longer bind to the new path`
+        : `Moved ${s.topic}/${s.name} → ${s.toTopic}/${s.name}: ${s.fileCount} artifacts moved with the paper folder, contents unchanged; ${s.detached} reader sessions no longer bind to the new path`) + extra
+    }
     case 'rename_paper':
       return zh
         ? `已重命名《${s.topic}/${s.name}》→《${s.topic}/${s.newName}》：${s.fileCount} 个文件同步改名；${s.detached} 个伴读会话不再自动挂到新路径`
@@ -418,10 +431,18 @@ function formatSummary(lang: ManageLang, s: ManageSummaryInput): string {
       return zh
         ? `已重命名专题《${s.topic}》→《${s.newName}》：目录整体移动；${s.detached} 个伴读会话不再自动挂到新路径`
         : `Renamed topic ${s.topic} → ${s.newName}: directory moved; ${s.detached} reader sessions no longer bind to the new path`
-    case 'delete_paper':
-      return zh
+    case 'delete_paper': {
+      // t4-F3：dirRemoved=false 表示论文目录里还有非产物条目（已原样保留）——必须如实提示，
+      // 否则用户不知道为什么专题树里还挂着一个同名「子专题」。
+      const residue = s.dirRemoved === false
+        ? (zh
+            ? '；注意：论文目录未删净（里面有非产物条目，已原样保留），它可能以同名子专题的形式继续显示，请手动检查'
+            : '; note: the paper folder was not fully removed (non-artifact entries remain); it may still appear as a same-name sub-topic, please check manually')
+        : ''
+      return (zh
         ? `已删除《${s.topic}/${s.name}》→ 回收站 ${s.trashRel}（${s.fileCount} 个文件，${s.totalBytes} 字节；按相对路径可手工移回恢复）`
-        : `Deleted ${s.topic}/${s.name} → trash ${s.trashRel} (${s.fileCount} files, ${s.totalBytes} bytes; recover manually by moving them back)`
+        : `Deleted ${s.topic}/${s.name} → trash ${s.trashRel} (${s.fileCount} files, ${s.totalBytes} bytes; recover manually by moving them back)`) + residue
+    }
     case 'delete_topic':
       if (s.trashRel) {
         return zh
@@ -506,8 +527,16 @@ async function requestManageApproval(opts: {
       lang)
   }
   if (signalAborted(exec)) throw approvalError(lang, 'cancelled', action)
-  const get = (ctx as unknown as { get?: (name: string) => unknown }).get
-  const svc = typeof get === 'function' ? (get.call(ctx, 'approval') as ApprovalAsk | undefined) : undefined
+  let svc: ApprovalAsk | undefined
+  try {
+    // `get.call` 本身也可能抛（Cordis 对缺失服务返回 undefined，只有**解析器自己坏掉**才会抛）。
+    // 那同样是「通道不可用」，必须统一成 approval-unavailable 并带机器码（t4-F4：以前会冒泡成裸 Error，
+    // 既没有 [library_manage:*] 前缀也没有 code，与 §4.1「所有拒绝都有机器码」有缺口）。
+    const get = (ctx as unknown as { get?: (name: string) => unknown }).get
+    svc = typeof get === 'function' ? (get.call(ctx, 'approval') as ApprovalAsk | undefined) : undefined
+  } catch {
+    throw approvalError(lang, 'unavailable', action)
+  }
   if (!svc || typeof svc.request !== 'function') throw approvalError(lang, 'unavailable', action)
   if (!exec?.agent) throw approvalError(lang, 'unavailable', action)
   let outcome: unknown
@@ -1245,6 +1274,8 @@ export function registerTools(ctx: Context, config: PluginConfig, guards?: Libra
           created: { type: 'boolean', description: 'create_topic：true=本次创建，false=已存在（幂等，无改动）。' },
           bytes: { type: 'integer', description: 'add_paper：写入的字节数。' },
           files: { type: 'array', required: true, items: { type: 'string' }, description: '受影响的文件名（不含目录）；create_topic/rename_topic 为空数组。' },
+          otherEntries: { type: 'array', items: { type: 'string' }, description: 'move_paper：随论文文件夹一起搬走的**非产物条目**（用户自放文件/子目录等）；其它动作省略。摘要里也会逐个点名。' },
+          dirRemoved: { type: 'boolean', description: 'delete_paper：论文目录是否已删净（false=里面还有非产物条目，已原样保留；摘要会如实提示可能残留成同名子专题）。' },
           trashDir: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true, description: '删除动作的回收站绝对路径（恢复线索）；非删除或无隐藏条目时为 null。' },
           trashRel: { oneOf: [{ type: 'string' }, { type: 'null' }], required: true, description: '回收站相对 dataDir 的路径（恢复线索；不含服务端绝对路径）。' },
           approval: { type: 'string', required: true, enum: ['not-required', 'allowed-once'], description: '本次是否经过用户审批：add/create=not-required；其余=allowed-once。' },
@@ -1319,22 +1350,21 @@ export function registerTools(ctx: Context, config: PluginConfig, guards?: Libra
             invalidateMigrationPromptCache(dataDir)
             const summary = formatSummary(lang, {
               action, topic: plan.topic, name: plan.name, toTopic: plan.toTopic,
-              fileCount: run.r.moved.length, detached: run.detached,
+              fileCount: run.r.moved.length, detached: run.detached, otherEntries: run.r.otherEntries,
             })
             return {
               ok: true, action, topic: plan.topic, name: plan.name, to_topic: plan.toTopic,
-              files: run.r.moved, trashDir: null, trashRel: null, approval: 'allowed-once' as const,
+              files: run.r.moved, otherEntries: run.r.otherEntries,
+              trashDir: null, trashRel: null, approval: 'allowed-once' as const,
               detachedSessions: run.detached, summary,
             }
           }
           case 'rename_paper': {
-            const topic = validateTopicPath(args.topic, true)
-            const name = validateEntryBoundary(args.name, 'paper')
-            const newName = validatePaperName(args.new_name)
-            const plan = planPaperDelete(dataDir, topic, name)   // 只读：存在性 / 产物 / `.pdf` 常规文件
-            if (newName === plan.name) {
-              throw toolErr('bad-request', 400, '新名称与原名称相同', 'The new name equals the current name', lang)
-            }
+            // 只读预检（t4-F1 修复）：planRenamePaper 与 add_paper/planMovePaper 同一套**三路**目标冲突判定
+            // （论文夹 / 平铺 `<new_name>.pdf` / 孤儿产物），并在**审批之前**完成 —— 既不会把
+            // 一篇既有旧布局文献静默遮蔽，也不再让用户点完「允许」才发现冲突。
+            const plan = planRenamePaper(dataDir, args.topic, args.name, args.new_name)
+            const newName = plan.newName
             const run = await g.runExclusive([g.topicKey(plan.topic), g.paperKey(plan.topic, plan.name)], async () => {
               const ref = { topic: plan.topic, name: plan.name }
               await g.requirePaperClear(ref)
@@ -1407,9 +1437,11 @@ export function registerTools(ctx: Context, config: PluginConfig, guards?: Libra
             const summary = formatSummary(lang, {
               action, topic: plan.topic, name: plan.name, fileCount: run.r.moved.length,
               totalBytes: plan.totalBytes, trashRel: run.r.trashRel, detached: run.detached,
+              dirRemoved: run.r.dirRemoved,
             })
             return {
               ok: true, action, topic: plan.topic, name: plan.name, files: run.r.moved,
+              dirRemoved: run.r.dirRemoved,
               trashDir: run.r.trashDir, trashRel: run.r.trashRel, approval: 'allowed-once' as const,
               detachedSessions: run.detached, summary,
             }

@@ -69,6 +69,9 @@ export type ManageCode =
   | 'move-partial'
   // 伴读会话状态不可知：host 原本用裸 json 输出，工具层需要机器码，故统一进闭集。
   | 'session-unknown'
+  // 「论文夹 + 同 stem 平铺残留」混合态（迁移冲突后的真实形态）：破坏性动作必须拒绝，
+  // 否则只处理一半却报告成功，会让同一篇重复出现或被静默遮蔽（t4 评审 F2）。
+  | 'layout-conflict'
   // 审批（ctx.approval.request）四态里除 allowed-once 之外的三态（fail closed）。
   | 'approval-rejected'
   | 'approval-cancelled'
@@ -539,6 +542,33 @@ export function moveToTrash(
 
 // ── 删除文献 ────────────────────────────────────────────────────────────────
 
+/**
+ * 「论文夹 + 同 stem 平铺残留」混合态检测（t4 评审 F2，修复口径 (a)：拒绝并提示先迁移）。
+ *
+ * 这是**迁移冲突之后**的真实库形态：论文夹 `<topic>/<名>/` 已存在，同时专题目录里还留着旧的
+ * 平铺产物（`<名>.pdf` / `<名>.txt` / `<名>-zh.pdf` …）。`listPapers` 的确定性优先级是「论文夹赢」，
+ * 所以平铺那半是**不可见的第二身份**：
+ *   · delete 只删论文夹 ⇒ 该篇立刻以 legacy 身份重新出现（"删了还在"）；
+ *   · rename 只改论文夹 ⇒ 旧名以 legacy 身份继续出现在库里（一个名字两篇）；
+ *   · move 只搬论文夹 ⇒ 同一篇同时出现在源专题（legacy）与目标专题（重复身份）。
+ * 三种都曾返回 `ok:true`。取向与 `move_paper` 拒绝旧布局一致：**让用户在界面把迁移做完**，
+ * 而不是在对话侧替他做半篇迁移（docs/migrate-prompt-plan.md 红线）。
+ *
+ * 只读；纯函数；不碰盘。
+ */
+export function assertNoLayoutConflict(topicDir: string, paperName: string): void {
+  // 没有论文夹 ⇒ 纯旧布局，交给既有 legacy 分支（delete/rename 允许，move 拒绝）
+  if (!existsSync(join(topicDir, paperName))) return
+  // 论文夹存在时，专题目录里不该再有同 stem 的平铺产物；有就是混合态
+  const flat = listArtifacts(topicDir, paperName)
+  if (flat.length === 0) return
+  throw new ManageError('layout-conflict', 409,
+    `该文献同时存在论文文件夹与旧平铺文件（${flat.map((f) => f.name).join('、')}），请先在界面完成迁移后再操作`, {
+      files: flat.map((f) => f.name),
+      hint: '设置 → 论文伴读 → 查看论文状态（读完警示后点一次「确认迁移」）',
+    })
+}
+
 export interface PaperDeletePlan {
   topic: string
   name: string
@@ -563,6 +593,8 @@ export function planPaperDelete(dataDir: string, topic: unknown, name: unknown):
   const paperName = validateEntryBoundary(name, 'paper')
   const topicName = validateTopicPath(topic, true)
   const topicDirAbs = resolveExistingTopicDir(dataDir, topicName)
+  // 混合态先拒（t4-F2）：论文夹 + 同 stem 平铺残留 ⇒ layout-conflict，不做「半篇」操作
+  assertNoLayoutConflict(topicDirAbs, paperName)
   // 布局判定（确定性优先级：论文文件夹存在 ⇒ folder；否则只有平铺 `<名>.pdf` ⇒ legacy）
   const layout: 'folder' | 'legacy' = isLegacyPaper(topicDirAbs, paperName) ? 'legacy' : 'folder'
   const paperDirAbs = resolveExistingPaperDir(dataDir, topicName, paperName)
@@ -1112,31 +1144,92 @@ export function renamedName(fileName: string, paperName: string, newName: string
   return fileName.startsWith(paperName) ? newName + fileName.slice(paperName.length) : fileName
 }
 
+export interface RenamePaperPlan {
+  topic: string
+  name: string
+  newName: string
+  /** `folder` = 新布局；`legacy` = 旧布局（改名 = 逐个平铺文件改名） */
+  layout: 'folder' | 'legacy'
+  /** 源论文夹（folder 布局）或专题目录本身（legacy 布局）的绝对路径 */
+  sourceDir: string
+  files: ManagedFile[]
+  totalBytes: number
+}
+
+/** 目标名的 realpath 是否与「源侧同名实体」是同一个东西（大小写-only 改名的放行判据）。 */
+function sameRealpath(a: string, b: string | null): boolean {
+  if (!b) return false
+  try {
+    return realpathSync(a) === realpathSync(b)
+  } catch {
+    return false // 目标不可读 → 视为冲突（与既有 renamePaper 分支同口径）
+  }
+}
+
+/**
+ * 改名目标的**三路冲突**判定（t4 评审 F1，修复）：与 `add_paper` / `planMovePaper` 同一口径 ——
+ *   `<topicDir>/<newName>/`（论文夹）|| `<topicDir>/<newName>.pdf`（旧布局平铺）||
+ *   `listArtifacts(topicDir, newName).length > 0`（孤儿 sidecar / 译文变体）
+ * 任一命中 → 409 `target-exists`。
+ *
+ * 为什么必须查平铺与孤儿产物：`listPapers` 的优先级是「论文夹赢」，所以一次只查论文夹的改名会把
+ * 一篇**既有旧布局文献从列表里静默遮蔽**（盘上还在，身份消失），而且返回成功。
+ * 大小写-only 改名的既有语义逐字保留：目标目录/平铺 pdf 与源是同一实体时不算冲突。
+ */
+function assertRenameTargetFree(topicDir: string, paperName: string, newName: string, sourceDir: string, layout: 'folder' | 'legacy'): void {
+  const targetDir = join(topicDir, newName)
+  const flatOld = join(topicDir, paperName + '.pdf')
+  const flatNew = join(topicDir, newName + '.pdf')
+  const dirHit = existsSync(targetDir) && !(layout === 'folder' && sameRealpath(targetDir, sourceDir))
+  const flatHit = existsSync(flatNew) && !(existsSync(flatOld) && sameRealpath(flatNew, flatOld))
+  const artifactsHit = listArtifacts(topicDir, newName).length > 0
+  if (!dirHit && !flatHit && !artifactsHit) return
+  throw new ManageError('target-exists', 409, `已存在同名文献或残留产物：${newName}`, { conflicts: [newName] })
+}
+
+/**
+ * `renamePaper` 的**只读**前置（一个实现，两处消费：工具在**审批前**预检、`renamePaper` 执行时复核）。
+ * 任一检查失败都抛 ManageError 且零改动；成功只返回计划，不碰盘。
+ */
+export function planRenamePaper(dataDir: string, topic: unknown, name: unknown, newNameRaw: unknown): RenamePaperPlan {
+  // rename-from（topic/name）只做边界类校验；改名**目标**名仍走命名规范类（validateNewPaperName）。
+  const topicName = validateTopicPath(topic, true)
+  const paperName = validateEntryBoundary(name, 'paper')
+  const newName = validateNewPaperName(newNameRaw, paperName)
+  // 全套存在性/产物/`.pdf` 常规文件/**混合态布局冲突**（t4-F2）都走既有 planPaperDelete
+  const del = planPaperDelete(dataDir, topicName, paperName)
+  const topicDir = resolveExistingTopicDir(dataDir, topicName)
+  const sourceDir = del.layout === 'folder' ? resolveExistingPaperDir(dataDir, topicName, paperName) : topicDir
+  assertRenameTargetFree(topicDir, paperName, newName, sourceDir, del.layout)
+  return {
+    topic: del.topic,
+    name: del.name,
+    newName,
+    layout: del.layout,
+    sourceDir,
+    files: del.files,
+    totalBytes: del.totalBytes,
+  }
+}
+
 /**
  * 重命名文献（新布局）：**先整体 rename 论文目录** `<old>/` → `<new>/`，再在目录内把
  * `<old><后缀>` 逐个改名为 `<new><后缀>`（方案 §B1.3 #13）。
  * 两步之间不原子 ⇒ 中途失败按逆序回滚（内部文件名 → 目录名），并如实报 `rename-partial`/`file-busy`。
+ *
+ * 目标冲突判定**复用 `planRenamePaper`**（三路 + 大小写-only 放行）：执行前会重新算一遍目标状态，
+ * 因此不存在「用旧计划执行」的窗口；UI 路由共用本函数，自动获得同一加严。
  */
 export function renamePaper(dataDir: string, topic: unknown, name: unknown, newNameRaw: unknown, renameImpl: RenameImpl = renameSync): RenameResult {
-  // rename-from（topic/name）只做边界类校验；改名**目标**名仍走命名规范类（validateNewPaperName）。
-  const topicName = validateTopicPath(topic, true)
-  const paperName = validateEntryBoundary(name, 'paper')
-  const topicDir = resolveExistingTopicDir(dataDir, topicName)
-  const newName = validateNewPaperName(newNameRaw, paperName)
+  const plan = planRenamePaper(dataDir, topic, name, newNameRaw)
+  const topicDir = resolveExistingTopicDir(dataDir, plan.topic)
   // 旧布局（未迁移）：产物平铺在专题目录里 ⇒ 逐个文件改名（原来的实现，行为逐字保留）
-  if (isLegacyPaper(topicDir, paperName)) return renameLegacyPaper(dataDir, topicDir, paperName, newName, renameImpl)
-  const paperDirAbs = resolveExistingPaperDir(dataDir, topicName, paperName)
-  const files = listArtifacts(paperDirAbs, paperName)
-  assertArtifactsContained(dataDir, paperDirAbs, files)
-  if (!files.some((f) => f.kind === 'pdf')) throw new ManageError('not-found', 404, `文献不存在：${paperName}.pdf`)
-
+  if (plan.layout === 'legacy') return renameLegacyPaper(dataDir, topicDir, plan.name, plan.newName, renameImpl)
+  const paperDirAbs = plan.sourceDir
+  const paperName = plan.name
+  const newName = plan.newName
+  const files = plan.files
   const targetDir = join(topicDir, newName)
-  if (existsSync(targetDir)) {
-    // 大小写-only 改名（同一目录）放行
-    let same = false
-    try { same = realpathSync(targetDir) === realpathSync(paperDirAbs) } catch { /* 目标不可读 → 视为冲突 */ }
-    if (!same) throw new ManageError('target-exists', 409, `已存在同名文献：${newName}`, { conflicts: [newName] })
-  }
 
   // ① 目录整体改名（同一文件系统内的元数据操作）
   if (targetDir !== paperDirAbs) {
@@ -1308,6 +1401,31 @@ export interface CreateTopicResult {
   created: boolean
 }
 
+/** 目标路径上「已存在的条目」形态：null=不存在；'dir'=真目录；'conflict'=普通文件/其它；'symlink'=符号链接。 */
+function existingEntryKind(dir: string): 'dir' | 'conflict' | 'symlink' | null {
+  let st
+  try {
+    st = lstatSync(dir)
+  } catch {
+    return null
+  }
+  if (st.isSymbolicLink()) return 'symlink'
+  return st.isDirectory() ? 'dir' : 'conflict'
+}
+
+/** `createTopic` 的「目标已存在」收口：目录 ⇒ 幂等 created:false；文件/符号链接 ⇒ 冲突（零改动）。 */
+function finishExistingTopic(dataDir: string, topic: string, kind: 'dir' | 'conflict' | 'symlink'): CreateTopicResult {
+  if (kind === 'symlink') {
+    // 与 resolveTopicDir 的 realpath 层同口径：符号链接专题一律拒（不隐式穿越）
+    throw new ManageError('escape-rejected', 400, `路径越界：专题目录是符号链接，已拒绝：${topic}`)
+  }
+  if (kind === 'conflict') {
+    throw new ManageError('target-exists', 409, `已存在同名文件或专题：${topic}`, { conflicts: [topic] })
+  }
+  resolveTopicDir(dataDir, topic)   // 真目录：realpath / 子路径包含再复核一次
+  return { ok: true, topic, created: false }
+}
+
 export function createTopic(dataDir: string, raw: unknown): CreateTopicResult {
   const topic = validateTopicPath(raw, false)
   const root = realDataDir(dataDir)
@@ -1317,11 +1435,11 @@ export function createTopic(dataDir: string, raw: unknown): CreateTopicResult {
     resolveTopicDir(dataDir, segs.slice(0, i).join('/'))
   }
   const dir = join(root, ...segs)
-  // 已存在 → 必须是库内真目录（不是符号链接）⇒ 幂等返回 created:false（路由也是 200）
-  if (existsSync(dir)) {
-    resolveTopicDir(dataDir, topic)
-    return { ok: true, topic, created: false }
-  }
+  // 已存在 → 必须是库内真目录（不是符号链接）⇒ 幂等返回 created:false（路由也是 200）。
+  // 同名**普通文件/其它非目录** → 409 target-exists（t3 低危：以前会走 resolveTopicDir 的 404，
+  // 与 add_paper/planMovePaper 的「名字被占用」语义不一致；这里统一成冲突，仍零副作用）。
+  const existing = existingEntryKind(dir)
+  if (existing !== null) return finishExistingTopic(dataDir, topic, existing)
   assertInside(root, dir)
   try {
     mkdirSync(dir, { recursive: true })
@@ -1329,8 +1447,9 @@ export function createTopic(dataDir: string, raw: unknown): CreateTopicResult {
     const code = (err as NodeJS.ErrnoException).code
     // 并发下被别人先建出来：仍是「已存在」语义（复核后返回 created:false，绝不覆盖内容）
     if (code === 'EEXIST') {
-      resolveTopicDir(dataDir, topic)
-      return { ok: true, topic, created: false }
+      const raced = existingEntryKind(dir)
+      if (raced !== null) return finishExistingTopic(dataDir, topic, raced)
+      throw new ManageError('target-exists', 409, `已存在同名文件或专题：${topic}`, { conflicts: [topic] })
     }
     if (code === 'EBUSY' || code === 'EPERM') {
       throw new ManageError('file-busy', 409, '位置被占用（可能正在阅读器或其他程序中打开），关闭后重试；本次未创建专题', { cause: code })
@@ -1445,7 +1564,18 @@ export function addPaper(
     try {
       linkImpl(tmpPath, finalPath)
       finalCreated = true
-      try { unlinkSync(tmpPath) } catch { /* 临时名残留：清理阶段兜底 */ }
+      // 收到这里时**落盘已经成功**（final 已就位、内容已校验）——临时名只是我们自己的残留。
+      // 清理绝对不能把一次成功的收录变成错误（数据已可用），但也不能完全静默（t3 低危：以前空 catch 吞掉）：
+      // 先 unlink，失败再 rm --force；仍失败就 warn 留痕（不扩 schema/summary 契约，不伪装成完全干净）。
+      try {
+        unlinkSync(tmpPath)
+      } catch (err) {
+        try {
+          rmSync(tmpPath, { force: true })
+        } catch {
+          console.warn('[dsh-paper-reader] addPaper: 收录成功但临时文件未能清理（可手动删除）:', basename(tmpPath), err)
+        }
+      }
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code
       if (code === 'EEXIST') {

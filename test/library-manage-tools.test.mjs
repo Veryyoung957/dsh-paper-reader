@@ -113,13 +113,17 @@ function fakeApproval(outcome = 'allowed-once') {
 }
 
 /** 工具替身：假 ctx 提供 `get('approval')`（与 Cordis 的运行时可选读取同形）。 */
-function makeTools(dataDir, { approval, guards, scanner } = {}) {
+function makeTools(dataDir, { approval, guards, scanner, getThrows = false } = {}) {
   const g = guards ?? createLibraryGuards(dataDir)
   if (scanner !== undefined) g.setPaperSessionScanner(scanner)
   const tools = {}
   const ctx = {
     tools: { register: (x) => { tools[x.name] = x } },
-    get: (name) => (name === 'approval' ? approval : undefined),
+    // getThrows：模拟 Cordis 的**服务解析器自己抛错**（缺失服务是返回 undefined，不抛）
+    get: (name) => {
+      if (getThrows) throw new Error('resolver exploded')
+      return name === 'approval' ? approval : undefined
+    },
   }
   registerTools(ctx, { dataDir }, g)
   return { tools, tool: tools.library_manage, guards: g }
@@ -174,7 +178,7 @@ test('A1 工具 schema 快照：6 个参数、无任何「模型自填确认」�
   // 输出 schema：required 字段齐全，且是扁平对象（DSL 不支持 oneOf 成员上的 required）
   assert.equal(tool.output.schema.type, 'object')
   assert.equal(tool.output.schema.additionalProperties, false)
-  for (const f of ['ok', 'action', 'topic', 'files', 'trashDir', 'trashRel', 'approval', 'detachedSessions', 'summary']) {
+  for (const f of ['ok', 'action', 'topic', 'files', 'trashDir', 'trashRel', 'approval', 'detachedSessions', 'summary', 'otherEntries', 'dirRemoved']) {
     assert.ok(tool.output.schema.properties[f], `输出 schema 缺字段 ${f}`)
   }
 })
@@ -1142,7 +1146,7 @@ test('E9 move 自子树：目标专题在源论文夹内部 → bad-request 409�
   assert.deepEqual(snap(data), before)
 })
 
-test('E10 rename 的目标冲突/回滚映射：已存在同名 → target-exists；注入 EBUSY → 409 且库不变', async () => {
+test('E10 rename 的目标冲突/回滚映射：已存在同名 → target-exists（**审批前**）；注入 EBUSY → 409 且库不变', async () => {
   const { data } = mkLib()
   newPaper(data, 'T', 'P')
   newPaper(data, 'T', 'Q')
@@ -1151,7 +1155,8 @@ test('E10 rename 的目标冲突/回滚映射：已存在同名 → target-exist
   const before = snap(data)
   const err = await catchErr(() => tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'Q' }, execOf()))
   assert.equal(err.code, 'target-exists')
-  assert.equal(ap.requests.length, 1, '目标冲突在授权后才由 renamePaper 的既有检查兜底（零副作用）')
+  // t6 修复：三路目标冲突判定已提前到**审批之前**（不再让用户点完「允许」才发现没必要）
+  assert.equal(ap.requests.length, 0, '目标冲突必须在审批前拒绝（t4-F1/④）')
   assert.deepEqual(snap(data), before)
   // 注入 EBUSY：库层既有语义（409 file-busy），工具只做码映射
   const e2 = await catchErr(() => LM.renamePaper(data, 'T', 'P', 'R', () => {
@@ -1331,4 +1336,208 @@ test('F6 全局不变量：registerTools 不因缺 get/each2 而崩（R9）；�
     'library_manage', 'list_papers', 'migration_prompt_choice', 'migration_report',
     'search_paper', 'study_progress', 'study_update', 'transcribe_pdf',
   ])
+})
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   G. t4 对抗评审 findings 的修复用例（t6 repair-round-2）
+   F1 改名目标三路冲突（含旧布局/孤儿产物）· F2 混合布局 layout-conflict ·
+   F3 otherEntries/dirRemoved 如实呈现 · F4 ctx.get 抛错 → approval-unavailable
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const papersOf = async (tools, topic) => (await tools.list_papers.execute({ topic }, execOf())).papers.map((p) => p).sort()
+
+test('G1a[F1] rename 目标被**旧布局**同名文献占用：target-exists、审批前拒绝、listPapers 不被遮蔽（含正向控制）', async () => {
+  // 夹具：T/P/（新布局）+ T/Q.pdf（旧布局）⇒ listPapers = [T/P, T/Q]
+  // 旧实现只查论文夹目录 ⇒ 放行 P→Q；Q 的平铺文件仍在盘上却被「论文夹优先」遮蔽 ⇒ listPapers 只剩 [T/Q]。
+  const { data } = mkLib()
+  newPaper(data, 'T', 'P')
+  legacyPaper(data, 'T', 'Q')
+  const ap = fakeApproval()
+  const { tool, tools } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  assert.deepEqual(await papersOf(tools, 'T'), ['T/P', 'T/Q'], '夹具：文件夹 P + 旧布局 Q 各一篇')
+  const err = await catchErr(() => tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'Q' }, execOf()))
+  assert.ok(err, '改成一个已被旧布局文献占用的名字必须被拒')
+  assert.equal(err.code, 'target-exists')
+  assert.equal(err.status, 409)
+  assert.equal(ap.requests.length, 0, '目标冲突在审批前判定（t4-F1：不再让用户点完才发现）')
+  assert.deepEqual(snap(data), before, '零副作用')
+  assert.deepEqual(await papersOf(tools, 'T'), ['T/P', 'T/Q'], '既有 legacy Q 不得被遮蔽（旧实现这里会变成 [T/Q]）')
+  // 正向控制：清掉平铺残留（等价于用户完成迁移）后，同一个改名必须成功 —— 证明不是「永远拒绝」
+  rmSync(join(data, 'T', 'Q.pdf'))
+  rmSync(join(data, 'T', 'Q.txt'))
+  const ok = await tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'Q' }, execOf())
+  assert.equal(ok.new_name, 'Q')
+  assert.deepEqual(await papersOf(tools, 'T'), ['T/Q'])
+})
+
+test('G1b[F1] rename 目标是一个**已存在的论文夹**：target-exists、审批前拒绝、listPapers 不变', async () => {
+  const { data } = mkLib()
+  newPaper(data, 'T', 'P')
+  newPaper(data, 'T', 'Q')
+  const ap = fakeApproval()
+  const { tool, tools } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  const err = await catchErr(() => tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'Q' }, execOf()))
+  assert.equal(err.code, 'target-exists')
+  assert.equal(ap.requests.length, 0)
+  assert.deepEqual(snap(data), before)
+  assert.deepEqual(await papersOf(tools, 'T'), ['T/P', 'T/Q'])
+})
+
+test('G1c[F1] rename 目标只剩**孤儿 sidecar**（无目录、无 pdf）：target-exists、审批前拒绝、孤儿原样保留', async () => {
+  const { data } = mkLib()
+  newPaper(data, 'T', 'P')
+  writeFileSync(join(data, 'T', 'Q.txt'), 'orphan sidecar')
+  const ap = fakeApproval()
+  const { tool, tools } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  const err = await catchErr(() => tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'Q' }, execOf()))
+  assert.equal(err.code, 'target-exists', '孤儿产物会让「新 PDF + 别人的旧缓存」混合，必须拒')
+  assert.equal(ap.requests.length, 0)
+  assert.deepEqual(snap(data), before)
+  assert.deepEqual(await papersOf(tools, 'T'), ['T/P'])
+  assert.ok(existsSync(join(data, 'T', 'Q.txt')), '孤儿 sidecar 原样保留')
+})
+
+/** 「论文夹 + 同 stem 平铺残留」混合态（迁移冲突之后的真实形态）。 */
+function mixedPaper(data, topic = 'T', name = 'P') {
+  const dir = newPaper(data, topic, name)                       // <T>/<P>/<P>.pdf + <P>.txt
+  writeFileSync(join(data, topic, name + '.pdf'), PDF('flat-' + name))
+  writeFileSync(join(data, topic, name + '.txt'), 'flat-cache')
+  return dir
+}
+
+test('G2a[F2] 混合布局 delete_paper：layout-conflict 409、零副作用、不弹审批；不留 legacy 幽灵；迁移完成后可正常删除', async () => {
+  const { data } = mkLib()
+  const dir = mixedPaper(data)
+  const ap = fakeApproval()
+  const { tool, tools } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  assert.deepEqual(await papersOf(tools, 'T'), ['T/P'], '夹具：listPapers 只显示论文夹那一半（平铺被遮蔽）')
+  const err = await catchErr(() => tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf()))
+  assert.ok(err)
+  assert.equal(err.code, 'layout-conflict')
+  assert.equal(err.status, 409)
+  assert.match(err.message, /界面完成迁移/)
+  assert.ok(Array.isArray(err.extra.files) && err.extra.files.includes('P.pdf'), `必须点名残留文件：${JSON.stringify(err.extra)}`)
+  assert.equal(ap.requests.length, 0, '混合态在审批前就被拒（用户不必为一个不可执行的操作点允许）')
+  assert.deepEqual(snap(data), before, '零副作用')
+  assert.deepEqual(await papersOf(tools, 'T'), ['T/P'], '不出现 legacy 幽灵身份（旧实现删完会变成 [T/P(legacy)]）')
+  // 正向控制：清掉平铺残留（= 用户完成迁移）后，删除成功且旧身份彻底消失
+  rmSync(join(data, 'T', 'P.pdf'))
+  rmSync(join(data, 'T', 'P.txt'))
+  const out = await tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf())
+  assert.equal(out.ok, true)
+  assert.ok(!existsSync(dir))
+  assert.deepEqual(await papersOf(tools, 'T'), [], '删除后 listPapers 不含该篇旧身份')
+})
+
+test('G2b[F2] 混合布局 rename_paper：layout-conflict 409；迁移完成后改名成功且旧名不再出现', async () => {
+  const { data } = mkLib()
+  mixedPaper(data)
+  const ap = fakeApproval()
+  const { tool, tools } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  const err = await catchErr(() => tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'R' }, execOf()))
+  assert.equal(err.code, 'layout-conflict')
+  assert.equal(err.status, 409)
+  assert.equal(ap.requests.length, 0)
+  assert.deepEqual(snap(data), before)
+  assert.deepEqual(await papersOf(tools, 'T'), ['T/P'], '不出现「旧名 legacy + 新名」两个身份')
+  rmSync(join(data, 'T', 'P.pdf'))
+  rmSync(join(data, 'T', 'P.txt'))
+  const out = await tool.execute({ action: 'rename_paper', topic: 'T', name: 'P', new_name: 'R' }, execOf())
+  assert.equal(out.new_name, 'R')
+  assert.deepEqual(await papersOf(tools, 'T'), ['T/R'], 'listPapers 不含旧身份 P')
+})
+
+test('G2c[F2] 混合布局 move_paper：layout-conflict 409；迁移完成后移动成功且不在两个专题重复出现', async () => {
+  const { data } = mkLib()
+  mixedPaper(data)
+  mkdirSync(join(data, 'S'), { recursive: true })
+  const ap = fakeApproval()
+  const { tool, tools } = makeTools(data, { approval: ap.service, scanner: async () => [] })
+  const before = snap(data)
+  const err = await catchErr(() => tool.execute({ action: 'move_paper', topic: 'T', name: 'P', to_topic: 'S' }, execOf()))
+  assert.equal(err.code, 'layout-conflict')
+  assert.equal(err.status, 409)
+  assert.equal(ap.requests.length, 0)
+  assert.deepEqual(snap(data), before)
+  assert.deepEqual(await papersOf(tools, 'T'), ['T/P'], '同一篇不得同时出现在源/目标（旧实现会 [S/P, T/P(legacy)]）')
+  rmSync(join(data, 'T', 'P.pdf'))
+  rmSync(join(data, 'T', 'P.txt'))
+  const out = await tool.execute({ action: 'move_paper', topic: 'T', name: 'P', to_topic: 'S' }, execOf())
+  assert.equal(out.to_topic, 'S')
+  assert.deepEqual(await papersOf(tools, 'T'), [], '源专题不含旧身份')
+  assert.deepEqual(await papersOf(tools, 'S'), ['S/P'])
+})
+
+test('G3[F3] move_paper 遇未知条目（自放文件/子目录）：otherEntries 字段与摘要都如实点名', async () => {
+  const { data } = mkLib()
+  const dir = newPaper(data, 'T', 'P')
+  writeFileSync(join(dir, 'notes.md'), 'user notes')
+  mkdirSync(join(dir, 'fig'), { recursive: true })
+  writeFileSync(join(dir, 'fig', 'a.png'), 'png')
+  mkdirSync(join(data, 'S'), { recursive: true })
+  const { tool } = makeTools(data, { approval: fakeApproval().service, scanner: async () => [] })
+  const out = await tool.execute({ action: 'move_paper', topic: 'T', name: 'P', to_topic: 'S' }, execOf())
+  assert.deepEqual([...out.otherEntries].sort(), ['fig', 'notes.md'], '非产物条目必须逐个列出（旧实现直接丢弃）')
+  assert.match(out.summary, /notes\.md/)
+  assert.match(out.summary, /fig/)
+  assert.match(out.summary, /另有 2 个非产物条目随目录一起搬走/)
+  assert.ok(existsSync(join(data, 'S', 'P', 'notes.md')), '它们确实随目录搬走了')
+})
+
+test('G4[F3] delete_paper 的论文夹未删净：dirRemoved=false 且摘要如实提示（不递归删）', async () => {
+  const { data } = mkLib()
+  const dir = newPaper(data, 'T', 'P')
+  writeFileSync(join(dir, 'notes.md'), 'user notes')
+  const { tool } = makeTools(data, { approval: fakeApproval().service, scanner: async () => [] })
+  const out = await tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf())
+  assert.equal(out.dirRemoved, false, '目录里有非产物条目 ⇒ 非递归 rmdir 失败，必须如实回报')
+  assert.match(out.summary, /未删净/)
+  assert.match(out.summary, /同名子专题/)
+  assert.ok(existsSync(join(dir, 'notes.md')), '非产物条目原样保留（工具不递归删除用户文件）')
+  // 对照：没有未知条目时 dirRemoved=true
+  const { data: d2 } = mkLib()
+  newPaper(d2, 'T', 'P')
+  const t2 = makeTools(d2, { approval: fakeApproval().service, scanner: async () => [] }).tool
+  const out2 = await t2.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf())
+  assert.equal(out2.dirRemoved, true)
+  assert.ok(!/未删净/.test(out2.summary))
+})
+
+test('G6[t3-low] create_topic 目标为同名**普通文件** → 409 target-exists（与 add/move 冲突语义一致），仍在审批外、零副作用', async () => {
+  const { data } = mkLib()
+  writeFileSync(join(data, 'T'), 'i am a file, not a topic dir')
+  const { tool } = makeTools(data, { approval: fakeApproval().service })
+  const before = snap(data)
+  const err = await catchErr(() => tool.execute({ action: 'create_topic', topic: 'T' }, execOf()))
+  assert.ok(err)
+  assert.equal(err.code, 'target-exists', `旧实现返回 404 not-found（t3 低危）：${err && err.code}`)
+  assert.equal(err.status, 409)
+  assert.deepEqual(snap(data), before, '零副作用')
+  assert.equal(statSync(join(data, 'T')).isFile(), true, '普通文件绝不被覆盖/删除')
+  // 已存在**目录**仍是幂等 created:false（E14 的对照，防止把「已存在的专题」误判成冲突）
+  mkdirSync(join(data, 'D'), { recursive: true })
+  const ok = await tool.execute({ action: 'create_topic', topic: 'D' }, execOf())
+  assert.equal(ok.created, false)
+})
+
+test('G5[F4] ctx.get("approval") 抛错 → approval-unavailable（有机器码/前缀），零副作用', async () => {
+  const { data } = mkLib()
+  newPaper(data, 'T', 'P')
+  // scanner 正常，确保走到审批门（否则会先因 session-unknown 拒绝）
+  const { tool } = makeTools(data, { approval: undefined, getThrows: true, scanner: async () => [] })
+  const before = snap(data)
+  const err = await catchErr(() => tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf()))
+  assert.ok(err, '必须失败')
+  assert.ok(err instanceof ManageError, `必须是带机器码的 ManageError（旧实现会冒泡裸 Error）：${err && err.stack}`)
+  assert.equal(err.code, 'approval-unavailable')
+  assert.equal(err.status, 503)
+  assert.match(err.message, /^\[library_manage:approval-unavailable\]/)
+  assert.match(err.message, /未做任何改动|nothing changed/)
+  assert.deepEqual(snap(data), before)
+  assert.ok(!existsSync(join(data, '.trash')))
 })
