@@ -29,6 +29,8 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+// 跨平台回收站相对路径判定（POSIX 用 `/`、Windows 用 `\`，与既有 library-clear-and-busy 同一份实现）
+import { isTrashRelPath } from './fs-probe.mjs'
 
 const ROOT = dirname(fileURLToPath(import.meta.url))
 const REPO = join(ROOT, '..')
@@ -1178,7 +1180,7 @@ test('E11 delete 回收站可恢复：manifest 记 relativeDir/files，按相对
   const out = await tool.execute({ action: 'delete_paper', topic: 'T', name: 'P' }, execOf())
   assert.ok(!existsSync(dir), '删除后论文夹消失')
   assert.ok(out.trashDir && existsSync(out.trashDir), '成功响应必须给回收站绝对路径（恢复线索）')
-  assert.ok(String(out.trashRel).startsWith('.trash/'))
+  assert.ok(isTrashRelPath(out.trashRel), `trashRel 必须是相对路径（跨平台判定）：${out.trashRel}`)
   assert.ok(!out.summary.includes(data), 'render/summary 只用相对路径，不暴露服务端绝对路径')
   const manifest = JSON.parse(readFileSync(join(out.trashDir, 'manifest.json'), 'utf8'))
   assert.equal(manifest.kind, 'paper')
