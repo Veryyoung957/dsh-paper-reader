@@ -76,6 +76,16 @@ dsh plugin --profile web add @ggboy123/dsh-paper-reader@latest   # same command 
 
 - Deletion = **moved to trash** `data/.trash/` (with a manifest; move files back to recover); it handles every artifact of the paper: `<paper>.pdf`, `.txt`, `.pages.json`, `.transcript.json`, `.mineru.md`, `.mineru.json`, `.embeddings.json`, `.study.json`, plus translation variants `<paper>-en.pdf` / `-zh.pdf` / `-dual.pdf` (including leftover `.tmp-*`); chat history is not deleted. Papers with a running session or an in-flight translation are refused up front; path traversal is rejected and mid-way failures roll back — details in [docs/features_EN.md](docs/features_EN.md)
 
+## Library organizing from the chat
+
+Inside a "Paper Reading" session you can also ask the agent to organize the library: create topics, add a local PDF to a topic, rename papers/topics, move a paper to another topic, and delete a paper or an empty topic (moved to trash, recoverable). The tool surface is a single `library_manage` with seven actions: `create_topic` / `add_paper` / `move_paper` / `rename_paper` / `rename_topic` / `delete_paper` / `delete_topic`.
+
+- **Delete, rename and cross-topic move raise a DSH approval card**: the action runs only for the one call you explicitly allow. Rejection, cancellation, or an unavailable approval channel (e.g. no interactive session) means **not a single byte changes** — there is no fallback to "the model confirms it itself"; the parameters have no confirm/token field at all, and saying "yes" in chat is not an authorization
+- **add_paper only reads the source file**: it is never moved, deleted or overwritten, and an existing paper is never overwritten. The source must be a regular PDF (not a symlink), non-empty, with a `%PDF-` header; a failed write is cleaned up to zero change
+- **Deletion still goes to the trash**: it shares the same trash, reader-session/translation preconditions and in-flight lock as the UI; the trash bundle carries a manifest, so moving files back restores the paper
+- **A non-empty topic can only be deleted paper by paper** (each with its own approval); bulk-clear stays a UI-only operation
+- **Legacy (flat-layout) papers cannot be moved by the tool**: the migration itself still runs only from "Settings → Paper Reading → View paper status" after your confirmation
+
 ## Contributing
 
 ```bash

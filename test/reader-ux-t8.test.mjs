@@ -135,3 +135,23 @@ test('U3 errText 为 busy / session-unknown 提供 zh/en 人类可读文案（�
     assert.match(en, /[A-Za-z]/, `${key} 的 en 文案应含拉丁字母：${en}`)
   }
 })
+
+test('U4 errText 为 layout-conflict 提供 zh/en 专门文案（说明先完成迁移，不回落 err.message）', () => {
+  const client = readFileSync(join(ROOT, '..', 'lib', 'client.js'), 'utf8')
+  // errText 的 switch 里必须有 layout-conflict 分支，且走 t()（不是默认分支回显 err.message）
+  assert.match(client, /case 'layout-conflict':\s*return t\('delLayoutConflict'\)/, 'errText 必须有 layout-conflict 分支')
+  const zh = dictValue(client, 'zh', 'delLayoutConflict')
+  const en = dictValue(client, 'en', 'delLayoutConflict')
+  assert.ok(zh && zh.length > 0, 'delLayoutConflict 的 zh 文案缺失')
+  assert.ok(en && en.length > 0, 'delLayoutConflict 的 en 文案缺失')
+  // 可执行文案：中文要说明「去完成迁移」并给出界面入口；英文同样
+  assert.match(zh, /迁移/, `zh 应说明先完成迁移：${zh}`)
+  assert.match(zh, /查看论文状态/, `zh 应给出界面入口：${zh}`)
+  assert.match(zh, /平铺|旧/, `zh 应说明是「论文夹 + 旧平铺」并存：${zh}`)
+  assert.match(en, /migrat/i, `en 应说明迁移：${en}`)
+  assert.match(en, /paper status/i, `en 应给出界面入口：${en}`)
+  // 「其余文案不变」：既有映射仍在（不因新增分支而改动/顺序错位）
+  assert.match(client, /case 'target-exists':\s*return t\('renameTargetExists'\)/)
+  assert.match(client, /case 'topic-not-empty':\s*return t\('delTopicNotEmpty'\)/)
+  assert.match(client, /case 'file-busy':\s*return t\('delBusyFile'\)/)
+})

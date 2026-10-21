@@ -295,6 +295,29 @@ test('P1 创建/删除对称：能创建的必然能删除；命名不规范的�
   }
 })
 
+test('P1b[R-F3] 建专题的祖先段是普通文件 → 409 target-exists（与工具同语义），零副作用；符号链接祖先仍 escape-rejected', async () => {
+  // 线上复现过的形态：库根下有个 `.md` 之类的普通文件，agent 拿它当「专题」再往下建子专题。
+  // 旧行为：祖先循环里 resolveTopicDir 抛 404 not-found「专题不存在」；修后与「目标自身同名文件」统一为 409。
+  writeFileSync(join(DATA, 'p1b-file'), 'i am a file, not a topic dir')
+  const before = snap(DATA)
+  for (const name of ['p1b-file/sub', 'p1b-file/a/b']) {
+    const r = await postJson('/api/library/topic', { name })
+    assert.equal(r.status, 409, `${name} 必须 409（不是 404）：${r.status} ${r.text}`)
+    assert.equal(r.body.code, 'target-exists', r.text)
+    assert.deepEqual(diffSnap(before, snap(DATA)), [], `${name} 被拒时零副作用（不创建任何目录/文件）`)
+  }
+  assert.equal(lstatSync(join(DATA, 'p1b-file')).isFile(), true, '普通文件原样保留（不覆盖/不删除）')
+  // 既有语义不放宽：祖先段是符号链接仍按 realpath 层拒绝（不是 409）
+  symlinkSync(OUTSIDE, join(DATA, 'p1b-evil'), 'dir')
+  const beforeLink = snap(DATA)   // 快照要在建链接**之后**取（否则链接自身会被算成差异）
+  const linked = await postJson('/api/library/topic', { name: 'p1b-evil/sub' })
+  assert.equal(linked.status, 400, linked.text)
+  assert.equal(linked.body.code, 'escape-rejected')
+  assert.deepEqual(diffSnap(beforeLink, snap(DATA)), [], '符号链接被拒时同样零副作用（链接本身还在）')
+  rmSync(join(DATA, 'p1b-file'), { force: true })
+  rmSync(join(DATA, 'p1b-evil'), { force: true })
+})
+
 test('P2 畸形 JSON 体 / 非对象体 → 可读 4xx（不是外层兜底的 500）', async () => {
   for (const raw of ['{ not json', 'null', '"str"', '[1,2]', '']) {
     const r = await api('/api/library/delete-paper', { method: 'POST', headers: { 'content-type': 'application/json' }, body: raw })
