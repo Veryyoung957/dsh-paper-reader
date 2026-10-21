@@ -198,3 +198,6 @@ cp -a "$SRC/README.md" "$SRC/README_EN.md" "$DST/"
   36 skipped**，本套件 **63/63**。
 - **红线不变**：未引入迁移执行工具、未改审批门语义（`src/tools.ts` 零改动）、未放宽既有断言、
   未 push/部署（t10 的改动只在本工作树；当前 GUI 里跑的是 t5 时点的构建，见 §5 注）。
+- **集成收尾 r2**：t11 复审 verdict=pass（[review-round4](library-manage-tools-review-round4.md)）后的
+  最终验证、文档一致性与**重新部署说明**见 [integration-r2](library-manage-tools-integration-r2.md)
+  （部署覆盖 `~/.dsh/local/dsh-paper-reader` 与 profiles 安装目录两处，需用户显式确认后执行）。

@@ -19,7 +19,8 @@
 
 ## 2. 新增用例与变异靶子（评审可独立复跑）
 
-新增 10 例（`test/library-manage-tools.test.mjs` G 组，总数 52 → 62）：
+新增 10 例（`test/library-manage-tools.test.mjs` G 组；**t6 时点**总数 52 → 62。t10 又补了 G7，
+当前为 **63 例**，见 §6）：
 
 | 用例 | 断言要点 |
 | --- | --- |
@@ -71,7 +72,8 @@
 1. **UI 文案未专门映射 `layout-conflict`**：`lib/client.js` 的 `errText` 无该分支，走 `err.message` 兜底（中文、可读）。本批 out of scope 不改 `lib/`；若要专门文案，需后续 UI 轮补一行 `case 'layout-conflict'`。
 2. **混合态的解决路径只提示「在界面完成迁移」**：工具不提供任何「合并/清理平铺残留」的能力（那等于替用户执行迁移，红线）。用户若不想迁移，只能在文件系统里自行处理。
 3. **`planTopicDelete`/`clearTopic` 未改动**：混合态论文会让专题「非空」而被拒；UI 的批量清空仍按既有逻辑只清论文夹那一半（既有语义，本轮不扩大改动面）。
-4. **UI 路由继承的加严未单独加用例**：本轮用例走工具层（`planRenamePaper`/`planPaperDelete` 同一实现）；UI 路由的行为由 `npm test` 的既有回归网兜底（全量 644 tests / 608 pass / 0 fail / 36 skipped，其中本套件 62 例 ⇒ 既有 582 例）。
+4. **UI 路由继承的加严未单独加用例**：本轮用例走工具层（`planRenamePaper`/`planPaperDelete` 同一实现）；UI 路由的行为由 `npm test` 的既有回归网兜底。
+   数字以**当前** tip 为准：全量 **647 tests / 611 pass / 0 fail / 36 skipped**，其中本套件 **63 例**（t6 时点曾为 644/608 与本套件 62 例；t10 新增 G7/P1b/U4 后为现值，见 §6）。
 5. **`create_topic` 的 404 残留面（t7 R-F3）**：t6 只把「目标自身是同名普通文件」统一成 409 `target-exists`；
    当时「祖先段是普通文件」（tool 与 `POST /api/library/topic` 路由）仍是 404。
    **→ 已由 t10 修复（见 §6）：两条路径共用 `preflightCreateTopic`，祖先段/目标非目录统一 409；符号链接仍 escape-rejected。**
@@ -84,8 +86,8 @@
 ```bash
 cd .worktrees/library-manage-tools
 npm run typecheck                                  # exit 0
-node --test test/library-manage-tools.test.mjs     # 62/62（A–G，0 skip）
-npm test                                           # 644 tests / 608 pass / 0 fail / 36 skipped
+node --test test/library-manage-tools.test.mjs     # 63/63（A–G，0 skip；t6 提交 89a1186 时点为 62/62）
+npm test                                           # 647 tests / 611 pass / 0 fail / 36 skipped（t6 时点 644/608，见 §6）
 node test/mutation-probe.mjs --only LM04           # 单条：注入=红 / 还原=绿 / diff clean
 node test/mutation-probe.mjs --only LM             # 全组 25/25（LM01–LM25，含 LM21–LM25），无「锚点命中 0 次」
 ```
