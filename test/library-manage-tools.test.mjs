@@ -1541,3 +1541,28 @@ test('G5[F4] ctx.get("approval") 抛错 → approval-unavailable（有机器码/
   assert.deepEqual(snap(data), before)
   assert.ok(!existsSync(join(data, '.trash')))
 })
+
+test('G7[R-F3] create_topic 的祖先段是普通文件 → 409 target-exists、零副作用（与目标自身同名文件同语义）', async () => {
+  // 线上复现形态：`<库根>/某个 .md` 是普通文件，agent 把它当专题再往下建子专题。
+  // 旧实现：祖先循环里 resolveTopicDir 抛 404 `not-found`（「专题不存在」）；修后与「目标自身同名文件」统一 409。
+  const { data } = mkLib()
+  writeFileSync(join(data, 'ParentFile'), 'i am a file, not a topic dir')
+  const ap = fakeApproval()
+  const { tool } = makeTools(data, { approval: ap.service })
+  const before = snap(data)
+  for (const topic of ['ParentFile/Sub', 'ParentFile/a/b']) {
+    const err = await catchErr(() => tool.execute({ action: 'create_topic', topic }, execOf()))
+    assert.ok(err, `${topic} 必须被拒`)
+    assert.equal(err.code, 'target-exists', `${topic}: ${err.code} ${err.message}`)
+    assert.equal(err.status, 409)
+    assert.match(err.message, /^\[library_manage:target-exists\] /)
+    assert.match(err.message, /ParentFile/, '错误文案要点名被占用的路径段，便于用户定位')
+    assert.deepEqual(snap(data), before, '零副作用：失败不创建任何目录/文件')
+  }
+  assert.equal(statSync(join(data, 'ParentFile')).isFile(), true, '普通文件原样保留（不覆盖/不删除）')
+  // 对照：真目录祖先仍可一次建多级子专题（既有能力不受影响）
+  mkdirSync(join(data, 'RealParent'), { recursive: true })
+  const ok = await tool.execute({ action: 'create_topic', topic: 'RealParent/Child' }, execOf())
+  assert.equal(ok.created, true)
+  assert.ok(existsSync(join(data, 'RealParent', 'Child')))
+})

@@ -93,23 +93,26 @@ fail-closed 边界（均在调用 `request()` 之前判定，或统一映射成 
 | 修复 r3 | `2f5e14f` | LM04 锚点逐字节对齐（`--only LM` 25/25）、repair 文档数字校正 |
 | 评审 r3 | [review-round3](library-manage-tools-review-round3.md)（t9，`07da33b`） | **verdict=pass**（R-F3 按契约不修、登记正确） |
 
-最终自测（本轮 t5 实测，见 §5）：
+最终自测（**t10 后复跑**，见 §5/§9；t5 首次集成时为 644/608/0/36）：
 
 - `npm run typecheck` → exit 0
-- `npm test` → **644 tests / 608 pass / 0 fail / 36 skipped**（`pretest` 自动 build；skip 全为既有平台/环境跳过）
+- `npm test` → **647 tests / 611 pass / 0 fail / 36 skipped**（`pretest` 自动 build；skip 全为既有平台/环境跳过）
 - `node --input-type=module -e "import dist/index.js; apply(假 ctx)"` → 注册 **8** 个工具
   （`list_papers, transcribe_pdf, search_paper, study_progress, study_update, migration_report,
   migration_prompt_choice, library_manage`），启动日志行同样列出 `library_manage`
 - `node test/mutation-probe.mjs --only LM` → **25/25**（注入红 / 还原绿 / diff clean，无锚点漂移）
-- 独立验证复跑：`node --test test/library-manage-tools.test.mjs` → 62/62（0 skip）
+- 独立验证复跑：`node --test test/library-manage-tools.test.mjs` → **63/63**（0 skip；t10 新增 G7）
 - 红线：`git diff 57309b2..HEAD -- src/migrate.ts` 为空；工具层 import 只含只读迁移能力
 
 ## 5. 交付面核对（t5 实测）
 
 - `git branch --show-current` = `feat/library-manage-tools`；`HEAD` 只被该分支包含（未合并主分支）。
 - 无 upstream、`refs/remotes` 里没有本分支（**未 push**）。
-- `~/.dsh/profiles/web/node_modules/@ggboy123/dsh-paper-reader/dist/index.js` 中 `library_manage`
-  命中 0 次、安装目录 mtime 仍为 2026-10-17（**未部署**本分支产物）。
+- t5 时点：`~/.dsh/profiles/web/node_modules/@ggboy123/dsh-paper-reader/dist/index.js` 中 `library_manage`
+  命中 0 次、安装目录 mtime 仍为 2026-10-17（**当时未部署**本分支产物）。
+  > 注（t10 补记）：t10 之前**用户**已把本分支安装到当前 GUI 做 live 复现（部署动作由用户执行）；
+  > t10 的改动（`preflightCreateTopic` / `delLayoutConflict`）尚未部署——安装目录里
+  > `dist/library-manage.js` 无 `preflightCreateTopic`、`lib/client.js` 无 `delLayoutConflict`。
 - `git status --porcelain` 为空（本报告的文档提交完成后）。
 - 基线以来的提交（`git log --oneline 57309b2..HEAD`；截至 `review-round3` 共 **10** 个，
   本报告的 docs-only 提交是第 **11** 个）：
@@ -123,12 +126,14 @@ fail-closed 边界（均在调用 `request()` 之前判定，或统一映射成 
    不是绕过）——可用性风险，不是安全风险。验证步骤见 plan §2.6 / review §10.1。
 2. **`displayReason` 在 0.2.x 的展示未验证**（devDep 0.1.5 无该字段）：实现只把它作为可选字段透传，
    判定完全不依赖它。
-3. **R-F3（继承的 404 不一致）**：tool 侧 `create_topic` 仅「目标自身同名普通文件」是 409，
-   「祖先段是普通文件」仍 404；UI 的 `POST /api/library/topic` 路由未改（也仍 404）。已登记，
-   本批不修（inScope 不含 `src/host.ts`）。
+3. ~~**R-F3（继承的 404 不一致）**~~ → **已由 t10 修复**：`create_topic` 的祖先段/目标为普通文件时，
+   tool 与 `POST /api/library/topic` 路由**共用** `preflightCreateTopic` 并统一返回 409 `target-exists`
+   （以前 tool 的祖先段与 UI 路由是 404）；符号链接仍 `escape-rejected`、真目录仍幂等 200。详见
+   [repair §6](library-manage-tools-repair.md) 与 §9；测试 G7（工具）/P1b（路由）。
 4. **UI 侧同样继承的加严**：`delete-plan`/`delete-paper`/`rename-paper` 路由共用同一实现，
-   混合态会 409 `layout-conflict`；`lib/client.js` 的 `errText` 无该码的专门文案，回落到
-   `err.message`（中文可读），无空白/裸码。UI 的批量清空仍按既有逻辑只清论文夹那一半（既有语义）。
+   混合态会 409 `layout-conflict`；t10 起 `lib/client.js` 的 `errText` 有该码的 **zh/en 专门文案**
+   （提示去「设置 → 论文伴读 → 查看论文状态」完成迁移），不再回落到 `err.message`。
+   UI 的批量清空仍按既有逻辑只清论文夹那一半（既有语义）。
 5. **跨进程并发不在支持范围**：在途锁是进程内 `Set`（与插件既有写路由同口径）；两个 dsh 进程指向
    同一 dataDir 时不同步。
 6. **平台未实跑**：Windows/macOS 的大小写不敏感与 EBUSY/EPERM 分支只做静态审查；用例在 Linux 实跑。
@@ -174,3 +179,22 @@ cp -a "$SRC/README.md" "$SRC/README_EN.md" "$DST/"
      点「拒绝」→ 工具返回 `approval-rejected` 且库内文件逐字节不变；再点「允许」→ 文献进回收站。
    - 反例（无审批 answerer 的会话）：同一动作应得 `approval-unavailable`，库零变化。
 4) 回滚：`rm -rf "$DST" && mv "$DST.bak-<时间戳>" "$DST"`，重启。
+
+
+## 9. t10 后续修复：R-F3（404 → 409）+ UI `layout-conflict` 文案
+
+本文件 §6 曾把 R-F3 记为「不在本批修」；后续任务 t10 已修复（实现细节与「哪些既有语义未动」见
+[library-manage-tools-repair.md](library-manage-tools-repair.md) §6）：
+
+- **共用预检**：`src/library-manage.ts` 新增 `preflightCreateTopic(dataDir, raw)`；`createTopic` 与
+  `src/host.ts` 的 `POST /api/library/topic` 都改用它 ⇒ 祖先段/目标是普通文件时统一 **409
+  `target-exists`**（以前是 404 `not-found`），符号链接仍 `escape-rejected`，真目录仍幂等 200，
+  失败零副作用。
+- **UI 文案**：`lib/client.js` 的 `errText` 新增 `case 'layout-conflict'`，zh/en 字典各加
+  `delLayoutConflict`（说明「论文文件夹与旧平铺文件并存，请先在 设置 → 论文伴读 → 查看论文状态
+  完成迁移」）；其余映射与文案未动。
+- **测试**：`test/library-manage-tools.test.mjs` G7（工具）、`test/integration-upstream-merge.test.mjs`
+  P1b（路由）、`test/reader-ux-t8.test.mjs` U4（client 文案）⇒ 全量 **647 tests / 611 pass / 0 fail /
+  36 skipped**，本套件 **63/63**。
+- **红线不变**：未引入迁移执行工具、未改审批门语义（`src/tools.ts` 零改动）、未放宽既有断言、
+  未 push/部署（t10 的改动只在本工作树；当前 GUI 里跑的是 t5 时点的构建，见 §5 注）。

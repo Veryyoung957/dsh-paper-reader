@@ -1413,50 +1413,87 @@ function existingEntryKind(dir: string): 'dir' | 'conflict' | 'symlink' | null {
   return st.isDirectory() ? 'dir' : 'conflict'
 }
 
-/** `createTopic` 的「目标已存在」收口：目录 ⇒ 幂等 created:false；文件/符号链接 ⇒ 冲突（零改动）。 */
-function finishExistingTopic(dataDir: string, topic: string, kind: 'dir' | 'conflict' | 'symlink'): CreateTopicResult {
-  if (kind === 'symlink') {
-    // 与 resolveTopicDir 的 realpath 层同口径：符号链接专题一律拒（不隐式穿越）
-    throw new ManageError('escape-rejected', 400, `路径越界：专题目录是符号链接，已拒绝：${topic}`)
-  }
-  if (kind === 'conflict') {
-    throw new ManageError('target-exists', 409, `已存在同名文件或专题：${topic}`, { conflicts: [topic] })
-  }
-  resolveTopicDir(dataDir, topic)   // 真目录：realpath / 子路径包含再复核一次
-  return { ok: true, topic, created: false }
+export interface TopicCreatePreflight {
+  /** 规范化后的专题路径（`A/B`；已逐段词法校验） */
+  topic: string
+  /** 目标目录的绝对路径（可能尚不存在；调用方用 `exists` 区分） */
+  dir: string
+  /** true = 目标已是库内**真目录**（调用方按幂等 created:false 处理）；false = 尚不存在，可 mkdir */
+  exists: boolean
 }
 
-export function createTopic(dataDir: string, raw: unknown): CreateTopicResult {
+/**
+ * 创建专题前的**共用只读预检**（agent 工具 `createTopic` 与 `POST /api/library/topic` 路由共用一份实现）。
+ *
+ * 语义（t10 / R-F3 统一）：
+ *   · 已存在的**祖先段**必须是库内真目录：
+ *       - 真目录 → `resolveTopicDir`（realpath + 子路径包含再复核）；
+ *       - 符号链接 → `escape-rejected`（既有语义，**不放宽**；含悬空链接）；
+ *       - 普通文件/其它非目录 → **409 `target-exists`**（以前落到 `resolveTopicDir` 的 404「专题不存在」，
+ *         与「目标自身同名文件 → 409」不一致；父段被文件占着同样不可能建成目录）；
+ *   · 目标自身：真目录 → `exists:true`；文件 → 409；符号链接 → `escape-rejected`；不存在 → `exists:false`。
+ * 全部只读：失败时**不创建任何目录/文件**。
+ */
+export function preflightCreateTopic(dataDir: string, raw: unknown): TopicCreatePreflight {
   const topic = validateTopicPath(raw, false)
   const root = realDataDir(dataDir)
   const segs = topic.split('/')
   for (let i = 1; i < segs.length; i++) {
-    if (!existsSync(join(root, ...segs.slice(0, i)))) break
-    resolveTopicDir(dataDir, segs.slice(0, i).join('/'))
+    const prefix = segs.slice(0, i).join('/')
+    const kind = existingEntryKind(join(root, ...segs.slice(0, i)))
+    if (kind === null) break   // 该段（及后续）不存在：交给 mkdir(recursive) 一次建多级
+    if (kind === 'symlink') {
+      throw new ManageError('escape-rejected', 400, `路径越界：专题目录是符号链接，已拒绝：${prefix}`)
+    }
+    if (kind === 'conflict') {
+      throw new ManageError('target-exists', 409,
+        `无法创建专题：路径中的「${prefix}」已存在同名文件（不是目录）`, { conflicts: [prefix] })
+    }
+    resolveTopicDir(dataDir, prefix)   // 真目录：realpath / 子路径包含再复核
   }
   const dir = join(root, ...segs)
-  // 已存在 → 必须是库内真目录（不是符号链接）⇒ 幂等返回 created:false（路由也是 200）。
-  // 同名**普通文件/其它非目录** → 409 target-exists（t3 低危：以前会走 resolveTopicDir 的 404，
-  // 与 add_paper/planMovePaper 的「名字被占用」语义不一致；这里统一成冲突，仍零副作用）。
-  const existing = existingEntryKind(dir)
-  if (existing !== null) return finishExistingTopic(dataDir, topic, existing)
-  assertInside(root, dir)
+  const target = existingEntryKind(dir)
+  if (target === 'symlink') {
+    throw new ManageError('escape-rejected', 400, `路径越界：专题目录是符号链接，已拒绝：${topic}`)
+  }
+  if (target === 'conflict') {
+    throw new ManageError('target-exists', 409, `已存在同名文件或专题：${topic}`, { conflicts: [topic] })
+  }
+  if (target === 'dir') {
+    resolveTopicDir(dataDir, topic)
+    return { topic, dir, exists: true }
+  }
+  return { topic, dir, exists: false }
+}
+
+export function createTopic(dataDir: string, raw: unknown): CreateTopicResult {
+  const pre = preflightCreateTopic(dataDir, raw)
+  // 已存在（且前面已确认真目录/非链接）⇒ 幂等返回 created:false（路由也是 200）
+  if (pre.exists) return { ok: true, topic: pre.topic, created: false }
+  const root = realDataDir(dataDir)
+  assertInside(root, pre.dir)
   try {
-    mkdirSync(dir, { recursive: true })
+    mkdirSync(pre.dir, { recursive: true })
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code
     // 并发下被别人先建出来：仍是「已存在」语义（复核后返回 created:false，绝不覆盖内容）
     if (code === 'EEXIST') {
-      const raced = existingEntryKind(dir)
-      if (raced !== null) return finishExistingTopic(dataDir, topic, raced)
-      throw new ManageError('target-exists', 409, `已存在同名文件或专题：${topic}`, { conflicts: [topic] })
+      const raced = existingEntryKind(pre.dir)
+      if (raced === 'dir') {
+        resolveTopicDir(dataDir, pre.topic)
+        return { ok: true, topic: pre.topic, created: false }
+      }
+      if (raced === 'symlink') {
+        throw new ManageError('escape-rejected', 400, `路径越界：专题目录是符号链接，已拒绝：${pre.topic}`)
+      }
+      throw new ManageError('target-exists', 409, `已存在同名文件或专题：${pre.topic}`, { conflicts: [pre.topic] })
     }
     if (code === 'EBUSY' || code === 'EPERM') {
       throw new ManageError('file-busy', 409, '位置被占用（可能正在阅读器或其他程序中打开），关闭后重试；本次未创建专题', { cause: code })
     }
     throw new ManageError('add-partial', 500, '创建专题失败（未做任何改动）', { cause: code ?? 'unknown' })
   }
-  return { ok: true, topic, created: true }
+  return { ok: true, topic: pre.topic, created: true }
 }
 
 export interface AddPaperOptions {

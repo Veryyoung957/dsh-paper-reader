@@ -72,10 +72,9 @@
 2. **混合态的解决路径只提示「在界面完成迁移」**：工具不提供任何「合并/清理平铺残留」的能力（那等于替用户执行迁移，红线）。用户若不想迁移，只能在文件系统里自行处理。
 3. **`planTopicDelete`/`clearTopic` 未改动**：混合态论文会让专题「非空」而被拒；UI 的批量清空仍按既有逻辑只清论文夹那一半（既有语义，本轮不扩大改动面）。
 4. **UI 路由继承的加严未单独加用例**：本轮用例走工具层（`planRenamePaper`/`planPaperDelete` 同一实现）；UI 路由的行为由 `npm test` 的既有回归网兜底（全量 644 tests / 608 pass / 0 fail / 36 skipped，其中本套件 62 例 ⇒ 既有 582 例）。
-5. **`create_topic` 的 404 残留面（t7 R-F3，本轮明确不修）**：t6 只把「目标自身是同名普通文件」统一成 409 `target-exists`；以下两处**仍是 404 `not-found`**：
-   - tool 侧：**祖先段**是普通文件时（如 `create_topic('A/B')` 而 `A` 是一个文件），逐段复核走既有 `resolveTopicDir` ⇒ 404（未改，保持最小改动面）；
-   - UI 侧：`POST /api/library/topic` 路由完全未改（本轮 inScope 不含 `src/host.ts`），目标自身或祖先段是普通文件都仍 404。
-   如要统一成 409，需后续轮同时改 `resolveTopicDir` 的调用点与路由（各 1~2 行）；本轮不扩范围。
+5. **`create_topic` 的 404 残留面（t7 R-F3）**：t6 只把「目标自身是同名普通文件」统一成 409 `target-exists`；
+   当时「祖先段是普通文件」（tool 与 `POST /api/library/topic` 路由）仍是 404。
+   **→ 已由 t10 修复（见 §6）：两条路径共用 `preflightCreateTopic`，祖先段/目标非目录统一 409；符号链接仍 escape-rejected。**
 6. **临时文件清理失败的可见性只到运行日志**：`console.warn` 不进入工具输出（不擅自扩 schema/summary 契约）；若将来要进 `summary`，需先更新 plan §1.5。
 7. **`test/reader-ux-verification.test.mjs` 的 VC1 白名单已按 t3 建议收窄**：`presets/` → `presets/paper-reader/agent\.cordis\.yml$`（只允许本轮 persona 文件）。实测非空转：临时造 `presets/paper-reader/evil-probe.yml` 时 VC1 变红并点名该文件；`agent.cordis.yml` 仍放行。
 8. t4 评审 §10 的其余残留（paper preset 审批 UI 真机可达性、`displayReason` 在 0.2.x 的展示、跨进程并发、`hasPdfMagic` 1KB 容忍、Windows/macOS 分支未实跑）本轮**未处理**，与 F1–F4 无关。
@@ -90,3 +89,44 @@ npm test                                           # 644 tests / 608 pass / 0 fa
 node test/mutation-probe.mjs --only LM04           # 单条：注入=红 / 还原=绿 / diff clean
 node test/mutation-probe.mjs --only LM             # 全组 25/25（LM01–LM25，含 LM21–LM25），无「锚点命中 0 次」
 ```
+
+
+## 6. t10 修复：`create_topic` 的祖先段非目录 404 → 409（R-F3）+ UI `layout-conflict` 文案
+
+### 6.1 改了什么
+
+| 位置 | 改动 |
+| --- | --- |
+| `src/library-manage.ts` | 新增**共用只读预检** `preflightCreateTopic(dataDir, raw): { topic, dir, exists }`：逐段检查**已存在的祖先**——真目录走既有 `resolveTopicDir`（realpath/子路径包含再复核）、符号链接 → `escape-rejected`、普通文件/其它非目录 → **409 `target-exists`**；目标自身同样分类（真目录 ⇒ `exists:true`、文件 ⇒ 409、链接 ⇒ escape、不存在 ⇒ `exists:false`）。`createTopic` 改为消费它（含 `mkdir` 的并发 `EEXIST` 分支复核）。 |
+| `src/host.ts`（`POST /api/library/topic`） | 删掉内联的祖先循环与目标分支，改调同一个 `preflightCreateTopic`：`exists=false` 时 `assertInside` + `mkdir(recursive)`；`exists=true` 时幂等 200。 |
+| `lib/client.js` | `errText` 新增 `case 'layout-conflict': return t('delLayoutConflict')`；zh/en 字典各加 `delLayoutConflict`：说明「论文文件夹与旧平铺文件并存，请先在 设置 → 论文伴读 → 查看论文状态 完成迁移」。其余映射与文案未动。 |
+| 测试 | `test/library-manage-tools.test.mjs` G7（tool：祖先段文件 → 409 + sha256 零改动 + 真目录祖先仍可建）；`test/integration-upstream-merge.test.mjs` P1b（路由：祖先段文件 → 409、深层同样、零副作用；符号链接祖先仍 `escape-rejected`）；`test/reader-ux-t8.test.mjs` U4（client：分支 + zh/en 文案 + 既有映射仍在）。 |
+
+### 6.2 为什么
+
+线上实测：`library_manage(create_topic, topic:"默认专题/<某个 .md>/sub")` 返回
+`[library_manage:not-found] 专题不存在：默认专题/…md`——同样是「名字被一个普通文件占用」，
+`add_paper`/`planMovePaper`/目标自身同名文件都是 409 `target-exists`，只有**祖先段**是 404。
+错误码不一致会让 agent/用户误判为「专题不存在（可以先建）」而不是「名字被文件占用」。
+UI 的 `layout-conflict` 之前没有专门文案，只回落到 `err.message`；用户在删除/改名受阻时看不到
+「先去界面完成迁移」的下一步。
+
+### 6.3 哪些既有语义未动（不放宽）
+
+- **符号链接祖先/目标**：仍走 `resolveTopicDir` 的 `lstat` + realpath + `assertInside` 三层，仍是
+  `escape-rejected`（400），不放行；悬空链接同样拒（`existingEntryKind` 用 `lstat`，不再被 `existsSync`
+  当成「不存在」）。
+- **已存在真目录**：仍幂等 200 / `created:false`，不覆盖内容；`mkdir(recursive)` 一次建多级不变。
+- **词法层**：`validateTopicPath` 逐段校验、`.trash` 保留名、深度/段长/总长上限、编码变形拒绝全部不变。
+- **`.trash` / 越界**：`assertInside` 与 realDataDir 的 realpath 层不变。
+- **上传路由**（`POST /api/library/upload`）与 `resolveUploadTopic` 未改动。
+- **审批门、迁移红线、工具输出 schema**：零改动（`src/tools.ts` 未触碰）。
+
+### 6.4 验证
+
+- `npm run typecheck` exit 0。
+- `npm test`：**647 tests / 611 pass / 0 fail / 36 skipped**（t5 时 644/608/0/36；本轮 +3 例全是新用例，
+  skip 数不变）。
+- `node --test test/library-manage-tools.test.mjs` → 63/63（0 skip）。
+- 工具/路由两端同一夹具：祖先段为普通文件 → `target-exists` 409、sha256 快照零改动、文件原样保留；
+  符号链接祖先 → `escape-rejected` 400、零副作用。

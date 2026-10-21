@@ -30,6 +30,7 @@ import {
   isManageError,
   planPaperDelete,
   planTopicDelete,
+  preflightCreateTopic,
   realDataDir,
   renamePaper,
   renameTopic,
@@ -527,21 +528,16 @@ export function registerRoutes(ctx: Context, config: PluginConfig, guards?: Libr
       }
       await withInflight(g.topicKey(name), res, async () => {
         try {
-          // name 是**相对路径**（`A` / `A/B`）：逐段词法校验 + 「已存在的祖先必须是库内真目录」。
-          // mkdir(recursive) 天然能一次建多级（方案 §B2.2「天然建多级」）；这里挡的是父链里**已存在**的那几段
-          // ——符号链接 / 指向库外的段一律拒（不隐式穿越），不存在的段交给 mkdir 创建。
-          const root = realDataDir(dataDir)
-          const segs = name.split('/')
-          for (let i = 1; i < segs.length; i++) {
-            if (!existsSync(join(root, ...segs.slice(0, i)))) break
-            resolveTopicDir(dataDir, segs.slice(0, i).join('/'))
+          // 共用只读预检（与 agent 工具 `createTopic` 同一实现，t10/R-F3）：
+          //   · 祖先段/目标已存在但**不是真目录**（普通文件等）⇒ 409 target-exists（以前是 404）；
+          //   · 符号链接/越界仍 escape-rejected；真目录 ⇒ exists=true，幂等 200，不重复 mkdir。
+          // mkdir(recursive) 天然能一次建多级（方案 §B2.2「天然建多级」）；不存在的段交给它创建。
+          const pre = preflightCreateTopic(dataDir, name)
+          if (!pre.exists) {
+            assertInside(realDataDir(dataDir), pre.dir)
+            await mkdir(pre.dir, { recursive: true })
           }
-          const dir = join(root, ...segs)
-          // 已存在 → 必须是真目录且不是符号链接（与 upload 同一条链路）；不存在 → 词法层已保证不越界
-          if (existsSync(dir)) resolveTopicDir(dataDir, name)
-          else assertInside(root, dir)
-          await mkdir(dir, { recursive: true })
-          json(res, 200, { ok: true, topic: name })
+          json(res, 200, { ok: true, topic: pre.topic })
         } catch (err) {
           if (!manageFail(res, err)) throw err
         }
