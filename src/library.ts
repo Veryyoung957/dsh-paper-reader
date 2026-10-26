@@ -13,7 +13,7 @@
 // ⚠️ 旧布局（<dataDir>/<专题>/<文献>.pdf 平铺）运行期**不再认**（方案 §B1.4 明确「不双读」）：
 // 升级后需跑一次幂等迁移（src/migrate.ts）把平铺产物收进论文文件夹。
 
-import { readdirSync, existsSync, mkdirSync, statSync, realpathSync, lstatSync } from 'node:fs'
+import { readdirSync, existsSync, mkdirSync, statSync, realpathSync, lstatSync, type Dirent } from 'node:fs'
 import { join, resolve, extname, basename, dirname, sep } from 'node:path'
 import { homedir } from 'node:os'
 // 破坏性原语与回收站实现（我们的加固层）：适配器只做「复用 #4 边界层 + 翻译签名/返回形状」，
@@ -90,13 +90,16 @@ export function topicSegments(raw: unknown, opts: { boundaryOnly?: boolean } = {
   if (!trimmed) throw new Error('名字不能为空')
   const enc = encodedEscapeError(trimmed)
   if (enc) throw new Error(enc)
-  if (trimmed.length > MAX_TOPIC_PATH) throw new Error(`名字过长（专题路径最多 ${MAX_TOPIC_PATH} 个字符）`)
+  // 长度上限是**创建侧**的命名规范（防病态输入），不是安全边界：边界类（删除/改名-from/清空）
+  // 作用于已存在的条目，若也卡新上限，上一版（单层 ≤120）能创建的长名专题会变成删不掉的孤儿
+  // （评审 F）。深度上限保留（分段数量不随「历史名字」增长，且是遍历成本护栏）。
+  if (!opts.boundaryOnly && trimmed.length > MAX_TOPIC_PATH) throw new Error(`名字过长（专题路径最多 ${MAX_TOPIC_PATH} 个字符）`)
   const segs = trimmed.split('/')
   if (segs.length > MAX_TOPIC_DEPTH) throw new Error(`专题层级过深（最多 ${MAX_TOPIC_DEPTH} 层）`)
   for (const seg of segs) {
     const err = opts.boundaryOnly ? validateEntryBoundary(seg) : validateEntryName(seg)
     if (err) throw new Error(err)
-    if (seg.trim().length > MAX_TOPIC_SEG) throw new Error(`专题名过长（每层最多 ${MAX_TOPIC_SEG} 个字符）`)
+    if (!opts.boundaryOnly && seg.trim().length > MAX_TOPIC_SEG) throw new Error(`专题名过长（每层最多 ${MAX_TOPIC_SEG} 个字符）`)
   }
   return segs.map((s) => s.trim())
 }
@@ -142,6 +145,71 @@ export function isPaperDir(dir: string): boolean {
   } catch {
     return false
   }
+}
+
+// ── 写侧布局碰撞预检（评审 B/C：绝不让写操作把已有条目遮蔽成「不可见 / 不可删」） ─────────────
+// 这些原语只读一层、缺目录返回空；「复用 isPaperDir 语义」是硬要求（不另写一套论文目录判据）。
+
+/** 读一层目录条目；不存在 / 不可读 → []（预检专用，绝不因目标尚未创建而抛错）。 */
+function dirEntries(dir: string): Dirent[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 已存在段里第一个**论文目录**（**从第 2 段起**）。返回相对路径（`A/B`），没有则 `null`。
+ *
+ * 论文目录不能再当专题父：在它下面新建专题/上传论文，`listPapers` / `listTopicTree` 会在论文目录处
+ * 停止递归，新条目整体从列表、树、范围提问里消失（评审 C1）。第 1 段（`<root>/A`）永远按专题解释
+ * ——与 `listPapers` 的 `isRoot` 口径一致，否则「平铺论文与一级专题同名」的历史布局会被误判。
+ */
+export function paperDirAncestor(root: string, segs: readonly string[]): string | null {
+  let cur = root
+  for (let i = 0; i < segs.length; i++) {
+    cur = join(cur, segs[i]!)
+    if (i === 0) continue
+    if (isPaperDir(cur)) return segs.slice(0, i + 1).join('/')
+  }
+  return null
+}
+
+/**
+ * 同层与 `<stem>` 同名的**旧平铺论文产物**（`<stem>.pdf/.txt/.pages.json/...`，即 `PAPER_STEM_SUFFIXES`）。
+ * 写侧一旦建出 `<stem>/` 论文文件夹，「文件夹优先」规则会让这些平铺产物永久从列表/树里消失
+ * （学习进度不可见、产物从 API 不可删 —— 评审 B2/C2）。
+ */
+export function flatArtifactNames(dir: string, stem: string): string[] {
+  const suffixes = manage.PAPER_STEM_SUFFIXES
+  return dirEntries(dir)
+    .filter((e) => e.isFile() && suffixes.some((s) => e.name === stem + s))
+    .map((e) => e.name)
+    .sort()
+}
+
+/**
+ * 同层与目标（`<stem>/` 或 `<stem><后缀>`）**仅大小写不同**的已存在条目，返回磁盘真实名。
+ * 大小写不敏感的文件系统（APFS/NTFS）上它们指向同一个条目 —— 上传会静默吞掉现有数据（评审 B3）；
+ * 大小写敏感盘上也返回同样的碰撞以保持跨平台确定性，错误文案据此点名冲突对象。
+ */
+export function caseVariantCollisions(dir: string, stem: string): string[] {
+  const targets = new Set<string>([stem, ...manage.PAPER_STEM_SUFFIXES.map((s) => stem + s)])
+  const lower = new Set([...targets].map((t) => t.toLowerCase()))
+  return dirEntries(dir)
+    .filter((e) => !targets.has(e.name) && lower.has(e.name.toLowerCase()))
+    .map((e) => e.name)
+    .sort()
+}
+
+/** 磁盘上 `name` 的真实拼写（大小写不敏感盘上「Paper」不能报成「paper」）；不存在则原样返回。 */
+export function existingEntryName(dir: string, name: string): string {
+  const entries = dirEntries(dir)
+  const exact = entries.find((e) => e.name === name)
+  if (exact) return exact.name
+  const folded = entries.find((e) => e.name.toLowerCase() === name.toLowerCase())
+  return folded ? folded.name : name
 }
 
 /**

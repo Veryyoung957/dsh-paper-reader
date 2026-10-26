@@ -19,6 +19,7 @@ import {
   MAX_TOPIC_DEPTH,
   MAX_TOPIC_PATH,
   MAX_TOPIC_SEG,
+  caseVariantCollisions,
   encodedEscapeError,
   assertInside as assertInsideShared,
   isPaperDir,
@@ -26,6 +27,7 @@ import {
   listPapers,
   normalizeTopicPath,
   paperDir,
+  paperDirAncestor,
   realDataDir as realDataDirShared,
   validateEntryBoundary as validateBoundaryShared,
   validateEntryName,
@@ -170,7 +172,12 @@ export function validateTopicPath(raw: unknown, boundaryOnly = false): string {
   // F4 负向：编码变形（`%2E%2E%2F`）解码后才是分隔符/上跳 ⇒ 一律拒（合法含 `%` 的名字不受影响）
   const enc = encodedEscapeError(trimmed)
   if (enc) throw new ManageError('bad-name', 400, enc)
-  if (trimmed.length > MAX_TOPIC_PATH) throw new ManageError('bad-name', 400, `名字过长（专题路径最多 ${MAX_TOPIC_PATH} 个字符）`)
+  // 长度上限（MAX_TOPIC_PATH / MAX_TOPIC_SEG）是**创建侧**的命名规范，不是安全边界。
+  // boundaryOnly（删除 / 改名-from / 清空）作用于**已存在**的条目：上一版允许 120 字专题名，
+  // 若这里也卡新增的 100/200 上限，那些 legacy 长名专题就从 API 删不掉也改不了名（评审 F），
+  // 违反「legacy 怪名字必须保持可删/可改名」的自定不变量。安全边界（分隔符 / `..` / NUL / 隐藏
+  // 保留名）仍然全程生效；创建侧上限不变。
+  if (!boundaryOnly && trimmed.length > MAX_TOPIC_PATH) throw new ManageError('bad-name', 400, `名字过长（专题路径最多 ${MAX_TOPIC_PATH} 个字符）`)
   const segs = trimmed.split('/')
   if (segs.length > MAX_TOPIC_DEPTH) throw new ManageError('bad-name', 400, `路径越界：专题层级过深（最多 ${MAX_TOPIC_DEPTH} 层）`)
   for (const seg of segs) {
@@ -179,7 +186,7 @@ export function validateTopicPath(raw: unknown, boundaryOnly = false): string {
     // 「专题」——那条是回收站，改名/删除它会毁掉用户的可恢复数据（VB4/P3 实测）。
     if (boundaryOnly) validateEntryBoundary(seg, 'topic')
     else validateName(seg, 'topic')
-    if (seg.trim().length > MAX_TOPIC_SEG) throw new ManageError('bad-name', 400, `名字过长（每层最多 ${MAX_TOPIC_SEG} 个字符）`)
+    if (!boundaryOnly && seg.trim().length > MAX_TOPIC_SEG) throw new ManageError('bad-name', 400, `名字过长（每层最多 ${MAX_TOPIC_SEG} 个字符）`)
   }
   return segs.map((s) => s.trim()).join('/')
 }
@@ -1071,6 +1078,33 @@ export function renamedName(fileName: string, paperName: string, newName: string
   return fileName.startsWith(paperName) ? newName + fileName.slice(paperName.length) : fileName
 }
 
+/** `fs.Stats` 里本判定真正需要的两个字段（纯函数入参，便于单测；不依赖真实 inode）。 */
+export interface FileIdentity {
+  readonly dev: number
+  readonly ino: number
+}
+
+/**
+ * renamePaper 逐文件冲突预检的「同一文件」判定（**纯函数**；评审 REV1-③ / C4 平台守卫）。
+ *
+ * 只有以下条件**全部**成立才放行（当成「同一次改名映射回自身」，不是冲突）：
+ *   · `sameEntry`：调用方确认两个**路径**指向同一个目录项（`realpath` 相同；大小写-only 改名在
+ *     大小写不敏感盘上才可能成立）；
+ *   · 两侧 `ino !== 0` 且 `dev !== 0`；
+ *   · 两侧 `(dev, ino)` 完全相同。
+ *
+ * **exFAT/FAT/部分 SMB 网络盘上 `stat().ino` 恒为 0**：若只比 inode，任何已存在的目标文件都会被判
+ * 「同一文件」⇒ 冲突预检被绕过 ⇒ `renameSync` 静默覆盖（维护者 C4 必修换块盘就复活）。
+ * 任一侧 ino（或 dev）为 0 一律返回 false ⇒ 走冲突 409。语义方向刻意保守：宁可误报冲突让用户
+ * 手动处理，绝不误放行覆盖。
+ */
+export function sameFileForRename(src: FileIdentity, dst: FileIdentity, sameEntry = true): boolean {
+  if (!sameEntry) return false
+  if (src.ino === 0 || dst.ino === 0) return false
+  if (src.dev === 0 || dst.dev === 0) return false
+  return src.ino === dst.ino && src.dev === dst.dev
+}
+
 /**
  * 重命名文献（新布局）：**先整体 rename 论文目录** `<old>/` → `<new>/`，再在目录内把
  * `<old><后缀>` 逐个改名为 `<new><后缀>`（方案 §B1.3 #13）。
@@ -1095,6 +1129,34 @@ export function renamePaper(dataDir: string, topic: unknown, name: unknown, newN
     let same = false
     try { same = realpathSync(targetDir) === realpathSync(paperDirAbs) } catch { /* 目标不可读 → 视为冲突 */ }
     if (!same) throw new ManageError('target-exists', 409, `已存在同名文献：${newName}`, { conflicts: [newName] })
+  }
+
+  // C4（评审 C4）：**逐文件冲突预检**必须在任何 rename 之前完成 —— 论文目录内若已有目标名文件
+  // （上次中断的残留 / 用户手放的同名文件），两段式改名的第二步会用 renameSync **静默覆盖**它
+  // （无 409、无回收站记录）。
+  // 唯一例外是「同一次改名映射回自身」（大小写-only 改名在大小写不敏感盘上）：必须**路径相同**
+  // 且 inode 有效才放行（见 sameFileForRename）。exFAT/FAT/部分网络盘 ino 恒 0 时一律按冲突处理，
+  // 绝不让平台差异绕过预检。
+  const innerClash: string[] = []
+  for (const f of files) {
+    const toName = renamedName(f.name, paperName, newName)
+    if (toName === f.name) continue
+    const srcAbs = join(paperDirAbs, f.name)
+    const dstAbs = join(paperDirAbs, toName)
+    let targetStat: ReturnType<typeof lstatSync> | null = null
+    try { targetStat = lstatSync(dstAbs) } catch { /* 目标不存在 → 无冲突 */ }
+    if (!targetStat) continue
+    let sameFile = false
+    try {
+      const srcStat = lstatSync(srcAbs)
+      let sameEntry = false
+      try { sameEntry = realpathSync(srcAbs) === realpathSync(dstAbs) } catch { /* 任一路径不可解析 → 保守判冲突 */ }
+      sameFile = sameFileForRename(srcStat, targetStat, sameEntry)
+    } catch { /* 源不可读 → 按冲突处理 */ }
+    if (!sameFile) innerClash.push(toName)
+  }
+  if (innerClash.length > 0) {
+    throw new ManageError('target-exists', 409, `目标目录内已存在同名文件：${innerClash.slice(0, 3).join('、')}${innerClash.length > 3 ? ' …' : ''}（改名会覆盖它，已拒绝）`, { conflicts: innerClash })
   }
 
   // ① 目录整体改名（同一文件系统内的元数据操作）
@@ -1162,6 +1224,14 @@ function renameLegacyPaper(dataDir: string, topicDir: string, paperName: string,
   const files = listArtifacts(topicDir, paperName)
   assertArtifactsContained(dataDir, topicDir, files)
   if (!files.some((f) => f.kind === 'pdf')) throw new ManageError('not-found', 404, `文献不存在：${paperName}.pdf`)
+  // C3（评审 C3）：逐文件预检只查「目标文件」，漏掉了「目标名已是一个**目录**」——
+  // 平铺改名撞上子专题名后，`<新名>.pdf` 会被「文件夹优先」规则永久遮蔽（列表/树/删除全看不见）。
+  // 必须在任何 rename 之前拒绝（target-exists 409）。
+  let targetDirStat: ReturnType<typeof lstatSync> | null = null
+  try { targetDirStat = lstatSync(join(topicDir, newName)) } catch { /* 不存在 → 无冲突 */ }
+  if (targetDirStat?.isDirectory()) {
+    throw new ManageError('target-exists', 409, `已存在同名目录：${newName}（平铺改名会被它遮蔽）`, { conflicts: [newName] })
+  }
   const clash: string[] = []
   for (const f of files) {
     const target = join(topicDir, renamedName(f.name, paperName, newName))
@@ -1222,9 +1292,42 @@ export function renameTopic(dataDir: string, name: unknown, newNameRaw: unknown,
   if (newTopic === topic) throw new ManageError('bad-request', 400, '新名称与原名称相同')
   const dir = resolveExistingTopicDir(dataDir, topic)
   const root = realDataDir(dataDir)
-  const parentRel = newTopic.split('/').slice(0, -1).join('/')
-  if (parentRel) resolveTopicDir(dataDir, parentRel)   // 父目录必须存在（404 文案复用）
-  const target = join(root, ...newTopic.split('/'))
+  const newSegs = newTopic.split('/')
+  const parentRel = newSegs.slice(0, -1).join('/')
+  const parentAbs = parentRel ? resolveTopicDir(dataDir, parentRel) : root   // 父目录必须存在（404 文案复用）
+  // 评审 REV1-① / t11：目标父级下已有**仅大小写不同**的同级对象 ⇒ 409 并点名磁盘真名。
+  // 不敏感盘上那是同一个目录别名（旧实现 return 200 ⇒ 假成功）；敏感盘上会并存两个近同名专题
+  // （upload 已经拒这类，此处对齐口径，避免「upload 拒绝、create/rename 放行」的分裂）。
+  //
+  // R5-01（t12 评审）：**同父级改名时，源目录自身会出现在这个清单里**（它就是要被改名的那个目录项）
+  // ——那不是碰撞，必须排除，否则合法的 self case-only 改名（`Alpha/CaseTopic → Alpha/casetopic`）
+  // 会被误拒（基线是 200，等于把已知平台限制扩大到 ext4）。只豁免「与源条目指向同一目录项」的那一条，
+  // 且**仅当目标父级 == 源目录父级**；跨父级移动时目标父级下的真实变体照旧 409。
+  const sourceParentRel = topic.includes('/') ? topic.slice(0, topic.lastIndexOf('/')) : ''
+  const sameParent = parentRel === sourceParentRel
+  const selfName = basename(dir)
+  const caseClash = sameParent
+    ? caseVariantCollisions(parentAbs, newSegs[newSegs.length - 1]!).filter((entry) => {
+        if (entry === selfName) return false            // 同一目录项（磁盘真名与源 basename 一致）
+        try {
+          // 防御大小写/别名形态：realpath 指向源目录 ⇒ 也是它自己，不是碰撞。
+          return realpathSync(join(parentAbs, entry)) !== realpathSync(dir)
+        } catch {
+          return true                                    // 解析不了 ⇒ 保守保留（宁可误报冲突）
+        }
+      })
+    : caseVariantCollisions(parentAbs, newSegs[newSegs.length - 1]!)
+  if (caseClash.length > 0) {
+    throw new ManageError('target-exists', 409, `已存在仅大小写不同的同名专题：${caseClash.join('、')}（大小写不敏感的文件系统上会互相吞掉）`, { conflicts: caseClash })
+  }
+  // C1（评审 C1 的第三处同门）：目标路径的**已存在祖先**若是论文目录 ⇒ 409。
+  // `resolveTopicDir` 只保证「目录存在」，论文目录也是目录；把子专题树搬进去后，
+  // listPapers/listTopicTree 在论文目录处停止递归 ⇒ 整棵子树从 API 消失（且 clearTopic 永远 409）。
+  const paperParent = paperDirAncestor(root, newSegs.slice(0, -1))
+  if (paperParent) {
+    throw new ManageError('target-exists', 409, `目标父级是论文目录，不能把专题移进去：${paperParent}`, { conflicts: [paperParent] })
+  }
+  const target = join(root, ...newSegs)
   if (existsSync(target)) throw new ManageError('target-exists', 409, `已存在同名专题：${newTopic}`)
   assertInside(root, target)
   // 移动到自己子树里：目标路径落在源目录之内 ⇒ 拒绝（409；不是 400 的命名问题）

@@ -25,6 +25,13 @@ import { matchArtifactName, PAPER_STEM_SUFFIXES, TRASH_DIR } from './library-man
 export const DONE_MARKER = '.migration-v1.done'
 /** 有跳过项时写的**部分完成**标记（队长裁定 1：绝不写「全部完成」的假成功标记）。 */
 export const PARTIAL_MARKER = '.migration-v1.partial.json'
+/**
+ * 阶段 1 的**半成品标记**（评审 E2）：`mkdir <论文名>/` 之后、产物复制完成之前被 kill，
+ * 残留目录会在复跑时被判成 `dir-other`（别人家的子专题）⇒ 该篇永远跳过。
+ * 在刚建出来的论文目录里写这个隐藏文件；复跑据此识别「这是我们自己上次的半成品」，
+ * 完成阶段 1 后删除。判据另有「空目录」一条（mkdir 后、写标记前就被杀的窗口）。
+ */
+export const MIGRATING_MARKER = '.migration-v1.inprogress'
 /** 允许「论文名 → 目录名」的长度上限（validateEntryName 是 120；目录名留余量到 100，与 §B2.5 一致）。 */
 const MAX_PAPER_DIR_NAME = 100
 
@@ -58,6 +65,9 @@ export interface MigrationPlan {
   unreadable: Array<{ dir: string; cause: string }>
   /** 已存在的论文目录（已迁移完成，跳过） */
   paperDirs: string[]
+  /** 上次阶段 1 中断留下的**半成品目录**（空目录 / 带 MIGRATING_MARKER 且只有本论文产物）：
+   *  复跑会先保守清理再照常迁移；别人的非空异目录**绝不**出现在这里。 */
+  halfProducts: string[]
   totals: { papers: number; files: number; bytes: number; needBytes: number }
   doneMarker: string | null
   /** 上一次运行留下的**部分完成**标记（有跳过项时才有；内容是 {partial, skipped[]}） */
@@ -135,6 +145,28 @@ function sizeOf(file: string): number {
   }
 }
 
+/** 目标副本与（平铺）源文件是否是同一份内容（E2 的「半成品是否其实已复制完整」判别用）。
+ *  与 planMigration 里的 sameEntry 同口径：常规文件比 size+sha256；符号链接比链接目标。 */
+function targetMatchesSource(root: string, targetRel: string, file: string, fromRel: string): boolean {
+  const fromAbs = join(root, fromRel)
+  const toAbs = join(root, targetRel, file)
+  let st
+  try {
+    st = lstatSync(fromAbs)
+  } catch {
+    return false
+  }
+  let tst
+  try {
+    tst = lstatSync(toAbs)
+  } catch {
+    return false
+  }
+  if (st.isSymbolicLink()) return tst.isSymbolicLink() && readlinkOf(fromAbs) === readlinkOf(toAbs)
+  if (!tst.isFile() || tst.isSymbolicLink()) return false
+  return sizeOf(toAbs) === st.size && sha256Of(toAbs) === sha256Of(fromAbs)
+}
+
 /**
  * 论文名能否当目录名（建不出同名目录才进 quarantine，绝不硬来）。
  *
@@ -151,6 +183,52 @@ function paperDirNameError(name: string): string | null {
 }
 
 /**
+ * 目标目录是不是**我们自己上次留下的半成品**（评审 E2；判据刻意保守）：
+ *   · `empty`：空目录 —— 典型现场是阶段 1 刚 mkdir 完、写标记/复制之前被 SIGKILL。
+ *     空目录没有任何用户数据，清掉它不会丢任何东西；
+ *   · `marked`：带 `MIGRATING_MARKER`，且其余条目**全部**是这篇论文的产物名
+ *     （`matchArtifactName(stem, …)`：本论文的 .pdf/.txt/… 以及它们的中断残留）。
+ * 其它任何形态（含目录、陌生文件、别人的隐藏文件）都返回 `null` ⇒ 仍按 dir-other 冲突处理，
+ * **绝不动别人的非空目录**。
+ */
+function ownHalfProductKind(dir: string, stem: string): 'empty' | 'marked' | null {
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return null
+  }
+  if (entries.length === 0) return 'empty'
+  let marked = false
+  for (const e of entries) {
+    if (e.isFile() && e.name === MIGRATING_MARKER) { marked = true; continue }
+    if (e.isFile() && matchArtifactName(stem, e.name)) continue
+    return null
+  }
+  return marked ? 'marked' : null
+}
+
+/** 清理一个**确认是我们自己的**半成品目录：只删标记与本论文产物，然后非递归 rmdir。
+ *  任何不认识的条目都会让 ownHalfProductKind 返回 null，这里根本不会被调用。 */
+function cleanupHalfProduct(root: string, rel: string): void {
+  const dir = join(root, rel)
+  const stem = basename(rel)
+  if (!ownHalfProductKind(dir, stem)) return
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const e of entries) {
+    if (!e.isFile()) continue
+    if (e.name !== MIGRATING_MARKER && !matchArtifactName(stem, e.name)) continue
+    try { unlinkSync(join(dir, e.name)) } catch { /* best-effort：删不掉就交给 mkdir/copy 的幂等路径 */ }
+  }
+  try { rmdirSync(dir) } catch { /* 非空/权限：留着（后续 mkdir(recursive) 照常工作） */ }
+}
+
+/**
  * 阶段 0：**只读预检**（绝不写盘），产出人类可读报告 + 机器可读 JSON。
  * 遍历规则：论文目录**不递归**（结构不变量，防复跑套娃）；一级/中间目录是专题，继续递归。
  */
@@ -164,6 +242,7 @@ export function planMigration(dataDir: string, home: string = dshHome()): Migrat
   const quarantine: MigrationPlan['quarantine'] = []
   const unreadable: MigrationPlan['unreadable'] = []
   const paperDirs: string[] = []
+  const halfProducts: string[] = []
 
   const walk = (rel: string) => {
     const dir = rel ? join(root, rel) : root
@@ -184,12 +263,23 @@ export function planMigration(dataDir: string, home: string = dshHome()): Migrat
     //   ② 已存在的论文文件夹 `<名>/`（F1/F1b：阶段 2 中断后平铺 pdf 可能已被删）
     //   ③ 隐藏的论文文件夹 `.hidden/`（同上）
     const byStem = new Map<string, string[]>()
+    /** 本层里被识别为「自己上次的半成品」的 stem（目标目录已带 MIGRATING_MARKER）：
+     *  规划时视为目标不存在，交给 runMigration 开头保守清理后重新复制。 */
+    const resumeHalfStems = new Set<string>()
     for (const e of entries) {
       const relPath = rel ? `${rel}/${e.name}` : e.name
       if (e.isDirectory()) {
         // 结构不变量（**唯一**的「论文目录不递归」判定点）：目录内有 `<目录名>.pdf` ⇒ 论文目录，
         // 登记 stem 供 F1/F1b 的残留收口用，然后**绝不递归进去**（否则复跑会产生 X/X/X.pdf 套娃）。
         if (isPaperDir(join(dir, e.name))) {
+          // E2：带半成品标记的论文目录也是**我们自己**留下的（例如只复制了 .pdf、.txt 前被杀）。
+          // 判据同 ownHalfProductKind（标记 + 其余全是本论文产物）⇒ 视作可续，不登记成 paperDirs。
+          if (ownHalfProductKind(join(dir, e.name), e.name) === 'marked') {
+            resumeHalfStems.add(e.name)
+            halfProducts.push(relPath)
+            byStem.set(e.name, [])
+            continue
+          }
           paperDirs.push(relPath)
           byStem.set(e.name, [])
           continue
@@ -227,6 +317,18 @@ export function planMigration(dataDir: string, home: string = dshHome()): Migrat
         quarantine.push({ paper: targetRel, reason: bad })
         continue
       }
+      // E2：带半成品标记的论文目录也可能**其实已经复制完整**（阶段 1 全部校验通过、删标记前被杀）。
+      // 先逐文件按内容确认：完整 ⇒ 按普通 dir-paper 走（进 alreadyDone 清源，保持 C5 的「可复跑」语义）；
+      // 不完整（缺文件 / 内容不符）⇒ 才当半成品清理后重来。
+      if (resumeHalfStems.has(stem)) {
+        const complete = files.length > 0 && files.every((f) => targetMatchesSource(root, targetRel, f, rel ? `${rel}/${f}` : f))
+        if (complete) {
+          resumeHalfStems.delete(stem)
+          const idx = halfProducts.lastIndexOf(targetRel)
+          if (idx >= 0) halfProducts.splice(idx, 1)
+          paperDirs.push(targetRel)
+        }
+      }
       let targetKind: 'none' | 'file' | 'dir-paper' | 'dir-other' = 'none'
       try {
         const tst = lstatSync(targetAbs)
@@ -236,12 +338,20 @@ export function planMigration(dataDir: string, home: string = dshHome()): Migrat
         conflicts.push({ paper: targetRel, target: targetRel, reason: '目标名被文件占据' })
         continue
       }
+      // E2：区分「别人家的子专题目录」与「我们上次阶段 1 的半成品目录」（含只复制了一部分文件的论文目录）。
+      let resumeHalf = resumeHalfStems.has(stem)
       if (targetKind === 'dir-other') {
-        // F-B：目标是**已存在的目录，但不是这篇论文的文件夹**（典型：同名子专题）⇒ 绝不能把平铺论文塞进去。
-        // 塞进去会让该目录同时是「专题」与「论文」：listPapers/listTopicTree 不再递归、子专题里原有论文
-        // 从列表与树里消失（文件还在盘上、用户却看不到）、clearTopic 永久 409。干跑就要报警。
-        conflicts.push({ paper: targetRel, target: targetRel, reason: '目标名已被子专题目录占据（会把子专题变成论文、子专题内论文从列表/树里消失）' })
-        continue
+        const half = ownHalfProductKind(targetAbs, stem)
+        if (half) {
+          resumeHalf = true
+          halfProducts.push(targetRel)
+        } else {
+          // F-B：目标是**已存在的目录，但不是这篇论文的文件夹**（典型：同名子专题）⇒ 绝不能把平铺论文塞进去。
+          // 塞进去会让该目录同时是「专题」与「论文」：listPapers/listTopicTree 不再递归、子专题里原有论文
+          // 从列表与树里消失（文件还在盘上、用户却看不到）、clearTopic 永久 409。干跑就要报警。
+          conflicts.push({ paper: targetRel, target: targetRel, reason: '目标名已被子专题目录占据（会把子专题变成论文、子专题内论文从列表/树里消失）' })
+          continue
+        }
       }
       for (const f of files) {
         const fromRel = rel ? `${rel}/${f}` : f
@@ -261,11 +371,15 @@ export function planMigration(dataDir: string, home: string = dshHome()): Migrat
         //   · 目标是符号链接：与源是同一份链接 ⇒ alreadyDone；否则 ⇒ conflict
         //   · 目标既不是常规文件也不是链接（目录/设备…）⇒ conflict
         // 只有**目标不存在**才进 moves。
+        // 半成品目录里的残留会在 runMigration 开头被清理，因此规划阶段一律视作「目标不存在」，
+        // 让这些文件重新进 moves（否则残留的 partial 文件会把该篇判成 conflict，永远跳过）。
         let targetKind: 'none' | 'file' | 'link' | 'other' = 'none'
-        try {
-          const tst = lstatSync(toAbs)
-          targetKind = tst.isSymbolicLink() ? 'link' : tst.isFile() ? 'file' : 'other'
-        } catch { targetKind = 'none' }
+        if (!resumeHalf) {
+          try {
+            const tst = lstatSync(toAbs)
+            targetKind = tst.isSymbolicLink() ? 'link' : tst.isFile() ? 'file' : 'other'
+          } catch { targetKind = 'none' }
+        }
         if (targetKind === 'none') {
           moves.push(entry)
         } else {
@@ -297,17 +411,21 @@ export function planMigration(dataDir: string, home: string = dshHome()): Migrat
   const all = [...moves, ...alreadyDone]
   const bytes = all.reduce((n, e) => n + e.bytes, 0)
   const markerPath = join(root, DONE_MARKER)
+  // E2：半成品目录里的标记/残留文件是我们自己的中间产物，不能再作为「孤儿 / 隐藏条目」报告给用户
+  // （否则一次中断后的干跑报告会凭空多出几个别人看不懂的条目）。
+  const underHalf = (p: string) => halfProducts.some((h) => p === h || p.startsWith(h + '/'))
   return {
     dataDir: root,
     generatedAt: new Date().toISOString(),
     moves,
     alreadyDone,
-    orphans,
-    hidden,
+    orphans: orphans.filter((p) => !underHalf(p)),
+    hidden: hidden.filter((p) => !underHalf(p)),
     conflicts,
     quarantine,
     unreadable,
     paperDirs,
+    halfProducts,
     totals: {
       papers: new Set(all.map((e) => dirname(e.to))).size,
       files: all.length,
@@ -386,12 +504,48 @@ function appendLog(logPath: string, entry: MigrationLogEntry): void {
   }
 }
 
+/**
+ * 读迁移日志（**逐行**解析，评审 E1）。
+ *
+ * 旧实现把整个 JSONL 塞进一个 try/catch：任何一行损坏（SIGKILL 打断 append 的典型现场）⇒ 返回 `[]`
+ * ⇒ `--rollback` 打印「已回滚 0 个文件」且 **exit 0** —— 静默空转的假成功，直接违反「降级必须如实提示」。
+ * 现在：坏行**显式报错**（指出行号与原因），由 CLI/路由映射成非 0 退出 / 409；空行跳过。
+ * 缺字段/非对象也按坏行处理（回滚不能对一条来路不明的记录装作没看见）。
+ */
 export function readMigrationLog(logPath: string): MigrationLogEntry[] {
+  let raw: string
   try {
-    return readFileSync(logPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as MigrationLogEntry)
-  } catch {
-    return []
+    raw = readFileSync(logPath, 'utf8')
+  } catch (err) {
+    throw new MigrationError('migrate-log-unreadable', `迁移日志不可读（${(err as NodeJS.ErrnoException).code ?? 'unknown'}）：${logPath}`)
   }
+  const out: MigrationLogEntry[] = []
+  const lines = raw.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!
+    if (!line.trim()) continue                      // 末尾换行 / 空行：不是坏行
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(line)
+    } catch (err) {
+      throw new MigrationError('migrate-log-corrupt', `迁移日志第 ${i + 1} 行不是合法 JSON（${(err as Error).message}）：${line.slice(0, 120)}`)
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new MigrationError('migrate-log-corrupt', `迁移日志第 ${i + 1} 行不是对象：${line.slice(0, 120)}`)
+    }
+    const e = parsed as Partial<MigrationLogEntry>
+    if (typeof e.from !== 'string' || typeof e.to !== 'string') {
+      throw new MigrationError('migrate-log-corrupt', `迁移日志第 ${i + 1} 行缺少 from/to 字段：${line.slice(0, 120)}`)
+    }
+    out.push({
+      from: e.from,
+      to: e.to,
+      bytes: typeof e.bytes === 'number' ? e.bytes : 0,
+      sha256: typeof e.sha256 === 'string' ? e.sha256 : '',
+      at: typeof e.at === 'string' ? e.at : '',
+    })
+  }
+  return out
 }
 
 /** 单次迁移的日志（进程内），供 rollbackMigration 在未显式给路径时使用。 */
@@ -416,14 +570,20 @@ export interface RunMigrationOptions {
 }
 
 /**
- * 阶段 1 + 阶段 2：执行迁移。
+ * 阶段 1 + 阶段 2 的**可暂停执行体**（生成器）：每复制/删除一个文件 `yield` 一次，
+ * 让同步入口（CLI/既有测试）与异步入口（HTTP 路由）共用同一份逻辑，避免两份实现漂移。
+ * 同步 `runMigration` 直接跑完；`runMigrationAsync` 在每次 yield 后让出事件循环（评审 E3）。
+ *
  * · 阶段 1（只复制）任一条失败 ⇒ **停止，不删任何源**，抛 MigrationError 带 {done, remaining}；
  * · 阶段 2 只有「全部论文都复制且校验通过」之后才开始：逐条**再校验一次**，一致才 unlink 源。
  */
-export function runMigration(dataDir: string, opts: RunMigrationOptions = {}): MigrationResult {
+function* runMigrationSteps(dataDir: string, opts: RunMigrationOptions = {}): Generator<number, MigrationResult, void> {
   const home = opts.home ?? dshHome()
   const root = resolveDataDir(dataDir)
   const plan = planMigration(root, home)
+  // E2：复跑前先清理**自己上次留下的半成品**（plan 已按保守判据识别：空目录 / 带标记且只有本论文产物）。
+  // 别人的非空异目录不会进 halfProducts，仍在 skippedPapers 里按 conflict 跳过、一个字节都不动。
+  for (const rel of plan.halfProducts) cleanupHalfProduct(root, rel)
   // 队长裁定 1：不合规论文名（quarantine）与冲突一律**跳过该篇、继续迁移**——绝不整库中止
   //（一篇坏名字/一个冲突挡住整个库是不可接受的）；但绝不允许「假成功」：跳过项在这里记账，
   // 结束时报进 `skippedPapers`，且**只在零跳过时**写 `.migration-v1.done`，否则写 `.partial`。
@@ -448,6 +608,9 @@ export function runMigration(dataDir: string, opts: RunMigrationOptions = {}): M
       const fromAbs = join(root, m.from)
       const toAbs = join(root, m.to)
       mkdirSync(dirname(toAbs), { recursive: true })
+      // E2：在刚建出来的论文目录里写半成品标记（`wx` = 已存在就忽略，幂等）。
+      // 阶段 1 全部校验通过后统一删除；中途被 kill 则留着，复跑据此识别「自己上次的半成品」。
+      try { writeFileSync(join(dirname(toAbs), MIGRATING_MARKER), '', { flag: 'wx' }) } catch { /* 已存在 / 权限：空目录判据仍可兜底 */ }
       if (m.symlink) {
         // 符号链接：只搬链接本身（绝不跟随复制目标内容）。
         // ⚠️ 这里**绝不**先 `rmSync(toAbs, {force:true})`：那会把目标处已有的条目删掉（正是 F-A 的祸根）。
@@ -469,6 +632,7 @@ export function runMigration(dataDir: string, opts: RunMigrationOptions = {}): M
       const entry: MigrationLogEntry = { from: m.from, to: m.to, bytes: fromSize, sha256: sha, at: new Date().toISOString() }
       appendLog(logPath, entry)
       done.push(entry)
+      yield done.length
       if (opts.failAfterCopies !== undefined && done.length >= opts.failAfterCopies) {
         throw new MigrationError('migrate-interrupted', `注入中断：已复制 ${done.length} 个文件（源未删除）`)
       }
@@ -485,6 +649,14 @@ export function runMigration(dataDir: string, opts: RunMigrationOptions = {}): M
         throw new MigrationError('migrate-verify-failed', '已完成条目校验失败（目标副本与源不一致）：' + m.from)
       }
       toUnlink.push({ from: m.from, to: m.to, bytes: m.bytes, sha256: sha256Of(toAbs), at: new Date().toISOString() })
+    }
+    // 阶段 1 的复制与校验全部通过 ⇒ 半成品标记完成使命，统一删掉（否则会在论文夹里留下隐藏文件）。
+    // 若恰好在删除循环里被 kill：复跑仍把论文夹当 dir-paper 处理，并在本轮结束前再次清理（幂等）。
+    {
+      const targetDirs = new Set([...todo, ...plan.alreadyDone].map((m) => dirname(join(root, m.to))))
+      for (const dir of targetDirs) {
+        try { rmSync(join(dir, MIGRATING_MARKER), { force: true }) } catch { /* 留着无害 */ }
+      }
     }
     // ── 阶段 2：源已全部校验过 ⇒ 逐个删源（删前再校验一次，双保险）──
     let removed = 0
@@ -504,6 +676,7 @@ export function runMigration(dataDir: string, opts: RunMigrationOptions = {}): M
       }
       removed++
       unlinked.push(e.from)
+      yield removed
       void i
     }
     // 自底向上 rmdir 空目录（**非递归**，空即删，绝不 rm -rf）
@@ -534,6 +707,30 @@ export function runMigration(dataDir: string, opts: RunMigrationOptions = {}): M
       throw new MigrationAborted({ ok: false, done, remaining: todo.filter((m) => !doneSet.has(m.from)), unlinked, error: err.message, logPath })
     }
     throw err
+  }
+}
+
+/**
+ * 同步执行迁移（CLI / 既有测试入口）：把生成器一次跑完，行为与改造前逐字一致。
+ */
+export function runMigration(dataDir: string, opts: RunMigrationOptions = {}): MigrationResult {
+  const it = runMigrationSteps(dataDir, opts)
+  let step = it.next()
+  while (!step.done) step = it.next()
+  return step.value
+}
+
+/**
+ * **不阻塞事件循环**的迁移（评审 E3：/migrate 曾在大库上冻结 PDF 流与 SSE）。
+ * 每个文件（复制/删除）之后 `setImmediate` 让出一次：迁移仍在同一进程内按原顺序执行，
+ * 原子性/失败/回滚语义与同步版完全同一份实现；只是把长任务切成可被其它请求插入的片段。
+ */
+export async function runMigrationAsync(dataDir: string, opts: RunMigrationOptions = {}): Promise<MigrationResult> {
+  const it = runMigrationSteps(dataDir, opts)
+  for (;;) {
+    const step = it.next()
+    if (step.done) return step.value
+    await new Promise<void>((resolve) => setImmediate(resolve))
   }
 }
 
